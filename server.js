@@ -49,11 +49,19 @@ async function parseMXL(buf){
 app.post('/api/import',upload.single('score'),async(req,res)=>{try{
  if(!req.file) throw Error('Choose a score file first.');
  const n=req.file.originalname.toLowerCase();
+ const b=req.file.buffer;
  let parsed;
- if(n.endsWith('.mid')||n.endsWith('.midi')) parsed=parseMidi(req.file.buffer);
- else if(n.endsWith('.mxl')) parsed=await parseMXL(req.file.buffer);
- else if(n.endsWith('.musicxml')||n.endsWith('.xml')) parsed=parseXML(req.file.buffer);
- else throw Error('Unsupported file type. Use .mxl, .musicxml, .xml, .mid, or .midi.');
+ // Detect the actual payload first. Some notation apps export plain MusicXML with an .mxl suffix.
+ const isZip=b.length>=4 && b[0]===0x50 && b[1]===0x4b && (b[2]===0x03 || b[2]===0x05 || b[2]===0x07) && (b[3]===0x04 || b[3]===0x06 || b[3]===0x08);
+ const isMidi=b.length>=4 && b.subarray(0,4).toString('ascii')==='MThd';
+ const head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/, '').trimStart();
+ const isXml=head.startsWith('<?xml') || head.startsWith('<score-partwise') || head.startsWith('<score-timewise');
+ if(isMidi) parsed=parseMidi(b);
+ else if(isZip) parsed=await parseMXL(b);
+ else if(isXml) parsed=parseXML(b);
+ else if(n.endsWith('.mid')||n.endsWith('.midi')) parsed=parseMidi(b);
+ else if(n.endsWith('.musicxml')||n.endsWith('.xml')||n.endsWith('.mxl')) parsed=parseXML(b);
+ else throw Error('Unsupported score. Choose an MXL, MusicXML/XML, MID, or MIDI file.');
  res.json(parsed);
 }catch(e){res.status(400).json({error:e.message})}});
 function noteName(m){const pc=['C','C♯','D','E♭','E','F','F♯','G','A♭','A','B♭','B'][m%12];return pc+(Math.floor(m/12)-1)}
