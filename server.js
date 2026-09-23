@@ -66,7 +66,37 @@ function selectedStreams(parts,selected){const streams=[];let v=1,order=0;for(co
 function typeFor(q){if(q>=4)return 'whole';if(q>=2)return 'half';if(q>=1)return 'quarter';if(q>=.5)return 'eighth';if(q>=.25)return '16th';return '32nd';}
 function beamXML(beams=[]){return beams.map(b=>`<beam number="${Number(b.number||1)}">${esc(b.value)}</beam>`).join('');}
 function noteXML(e,voiceNo,div,chord=false,stem='',beams=[]){const d=Math.max(1,Math.round(e.dur*div)),staff=e.midi>=60?1:2;return `<note>${chord?'<chord/>':''}<pitch><step>${esc(e.step)}</step>${e.alter?`<alter>${e.alter}</alter>`:''}<octave>${e.octave}</octave></pitch><duration>${d}</duration><voice>${voiceNo}</voice><type>${typeFor(e.dur)}</type>${e.dot?'<dot/>':''}${stem?`<stem>${stem}</stem>`:''}${beamXML(beams)}<staff>${staff}</staff></note>`;}
-function restXML(q,voiceNo,div,staff){if(q<=.0001)return '';return `<note><rest/><duration>${Math.max(1,Math.round(q*div))}</duration><voice>${voiceNo}</voice><type>${typeFor(q)}</type><staff>${staff}</staff></note>`;}
+function restSpec(q){
+ const vals=[
+  [4,'whole',0],[3,'half',1],[2,'half',0],[1.5,'quarter',1],[1,'quarter',0],
+  [.75,'eighth',1],[.5,'eighth',0],[.375,'16th',1],[.25,'16th',0],[.1875,'32nd',1],[.125,'32nd',0]
+ ];
+ return vals.find(([v])=>Math.abs(q-v)<.0001)||null;
+}
+function restXML(q,voiceNo,div,staff,{measure=false}={}){
+ if(q<=.0001)return '';
+ if(measure)return `<note><rest measure="yes"/><duration>${Math.max(1,Math.round(q*div))}</duration><voice>${voiceNo}</voice><staff>${staff}</staff></note>`;
+ const sp=restSpec(q),type=sp?sp[1]:typeFor(q),dots=sp?sp[2]:0;
+ return `<note><rest/><duration>${Math.max(1,Math.round(q*div))}</duration><voice>${voiceNo}</voice><type>${type}</type>${'<dot/>'.repeat(dots)}<staff>${staff}</staff></note>`;
+}
+// Re-notate genuine silence instead of copying parser/bookkeeping gaps verbatim. Pieces are
+// split at the prevailing beat-group boundary, then expressed with the largest conventional
+// rest value that fits. This keeps rests readable and avoids strings of tiny rests.
+function restRunXML(start,q,voiceNo,div,staff,beats,beatType,measureQ){
+ if(q<=.0001)return '';
+ if(start<=.0001 && Math.abs(q-measureQ)<.0001)return restXML(q,voiceNo,div,staff,{measure:true});
+ const compound=beatType===8 && beats>=6 && beats%3===0,groupQ=compound?1.5:(4/beatType);
+ let pos=start,left=q,out='';
+ const candidates=[4,3,2,1.5,1,.75,.5,.375,.25,.1875,.125];
+ while(left>.0001){
+  const nextBoundary=(Math.floor((pos+1e-7)/groupQ)+1)*groupQ;
+  const room=Math.min(left,Math.max(.0001,nextBoundary-pos));
+  let take=candidates.find(v=>v<=room+.0001 && restSpec(v));
+  if(!take)take=Math.min(room,left);
+  out+=restXML(take,voiceNo,div,staff);pos+=take;left-=take;
+ }
+ return out;
+}
 function stemAssignments(streams,m){
  const map=new Map(),groups=new Map();
  for(const s of streams) for(const e of s.events.filter(e=>(e.measure||0)===m)){
@@ -168,26 +198,50 @@ function condensedLanes(streams,m){
 function makeReduction(parts,selected,meta={}){
  const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
  const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],beats=Number(first?.meta?.beats||4),beatType=Number(first?.meta?.beatType||4),fifths=Number(first?.meta?.fifths||0),measureQ=beats*(4/beatType),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
- // Give each logical engraving lane a stable MusicXML voice number across measures.
- const laneVoiceNos=new Map(); let nextVoice=1;
- for(let m=0;m<=maxM;m++) for(const lane of condensedLanes(streams,m)) if(!laneVoiceNos.has(lane.key))laneVoiceNos.set(lane.key,nextVoice++);
+ // Build every measure once, then keep stable lane/voice identities throughout the score.
+ const lanesByMeasure=[]; const laneVoiceNos=new Map(); const laneRange=new Map(); let nextVoice=1;
+ for(let m=0;m<=maxM;m++){
+  const lanes=condensedLanes(streams,m);lanesByMeasure[m]=lanes;
+  for(const lane of lanes){
+   if(!laneVoiceNos.has(lane.key))laneVoiceNos.set(lane.key,nextVoice++);
+   const r=laneRange.get(lane.key)||{first:m,last:m,staff:lane.staff};r.first=Math.min(r.first,m);r.last=Math.max(r.last,m);laneRange.set(lane.key,r);
+  }
+ }
  let measures='';
  for(let m=0;m<=maxM;m++){
-  let body=''; const lanes=condensedLanes(streams,m);
+  let body='';
+  // Render lanes that actually sound in this measure. A lane silent for a complete measure is
+  // represented only when it disappears between two sounding measures; this avoids redundant
+  // stacked whole-measure rests while preserving a real interruption of an independent voice.
+  const sounding=new Map((lanesByMeasure[m]||[]).map(l=>[l.key,l]));
+  const lanes=[...sounding.values()];
+  for(const [key,r] of laneRange){
+   if(!sounding.has(key) && m>r.first && m<r.last){
+    const prev=(lanesByMeasure[m-1]||[]).some(l=>l.key===key),next=(lanesByMeasure[m+1]||[]).some(l=>l.key===key);
+    if(prev&&next)lanes.push({key,staff:r.staff,events:[],silentMeasure:true});
+   }
+  }
+  lanes.sort((a,b)=>(a.staff-b.staff)||(laneVoiceNos.get(a.key)-laneVoiceNos.get(b.key)));
   for(let li=0;li<lanes.length;li++){
-   const lane=lanes[li],voiceNo=laneVoiceNos.get(lane.key),es=lane.events;
+   const lane=lanes[li],voiceNo=laneVoiceNos.get(lane.key),es=lane.events||[];
    const beamMap=generatedBeams(es,beats,beatType); let cursor=0;
-   for(let i=0;i<es.length;i++){
+   if(lane.silentMeasure){
+    body+=restXML(measureQ,voiceNo,div,lane.staff,{measure:true});cursor=measureQ;
+   }else{
+    for(let i=0;i<es.length;i++){
      const g=es[i],start=Number(g.start||0);
-     // Silent positioning uses <forward>, not visible rests. These gaps are bookkeeping,
-     // not rests a keyboard player needs to see.
-     if(start>cursor+.0001)body+=forwardXML(start-cursor,div,voiceNo,lane.staff);
-     const notes=[...g.notes].sort((a,b)=>a.midi-b.midi);
-     const beams=beamMap.get(i)||[];
+     // A gap inside a surviving rhythmic lane is genuine notated silence. Re-group it into
+     // conventional rests. <forward> is reserved for XML positioning, never musical silence.
+     if(start>cursor+.0001)body+=restRunXML(cursor,start-cursor,voiceNo,div,lane.staff,beats,beatType,measureQ);
+     const notes=[...g.notes].sort((a,b)=>a.midi-b.midi),beams=beamMap.get(i)||[];
      notes.forEach((e,j)=>{body+=noteXML(e,voiceNo,div,j>0,j===0?g.stem:'',j===0?beams:[])});
      cursor=Math.max(cursor,start+Number(g.dur||0));
+    }
+    // Preserve a genuine release before the barline when this same logical voice continues
+    // later. If the voice actually ends here, don't manufacture a trailing rest just to fill XML.
+    const r=laneRange.get(lane.key);
+    if(cursor<measureQ-.0001 && r && m<r.last)body+=restRunXML(cursor,measureQ-cursor,voiceNo,div,lane.staff,beats,beatType,measureQ),cursor=measureQ;
    }
-   // Do not emit trailing bookkeeping rests. Backup returns to measure start for next lane.
    if(li<lanes.length-1)body+=`<backup><duration>${Math.round(cursor*div)}</duration></backup>`;
   }
   const attrs=m===0?`<attributes><divisions>${div}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beats}</beats><beat-type>${beatType}</beat-type></time><staves>2</staves><part-symbol>brace</part-symbol><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>F</sign><line>4</line></clef></attributes>`:'';
@@ -195,7 +249,6 @@ function makeReduction(parts,selected,meta={}){
  }
  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
-
 let toolkitPromise;
 async function getToolkit(){if(!toolkitPromise)toolkitPromise=createVerovioModule().then(m=>new VerovioToolkit(m));return toolkitPromise;}
 function engravingGeometry(layout={}){const landscape=layout.orientation==='landscape',base=layout.pageSize==='a4'?{w:2100,h:2970,pw:595.28,ph:841.89}:{w:2159,h:2794,pw:612,ph:792};return landscape?{w:base.h,h:base.w,pw:base.ph,ph:base.pw}:{w:base.w,h:base.h,pw:base.pw,ph:base.ph};}
