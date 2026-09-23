@@ -633,19 +633,28 @@ async function runVisualTranscription(jobReq){
  const verify=String(jobReq.body?.verify||'0')!=='0';
  const segmented=String(jobReq.body?.segmented||'0')==='1';
 
+ const sourceContent=[];
  for(const f of files){
-  const mime=f.mimetype||(/\.pdf$/i.test(f.originalname)?'application/pdf':'image/png');
-  const fd=new FormData();fd.append('purpose','user_data');fd.append('file',new Blob([f.buffer],{type:mime}),f.originalname||'score-page');
+  const mime=(f.mimetype||(/\.pdf$/i.test(f.originalname)?'application/pdf':'image/png')).toLowerCase();
+  if(mime.startsWith('image/')){
+   // Responses accepts images as input_image content, not as context-stuffing files.
+   // Sending PNG/JPEG through /v1/files with purpose=user_data triggers the
+   // "Expected context stuffing file type ... but got .png" error.
+   const b64=f.buffer.toString('base64');
+   sourceContent.push({type:'input_image',image_url:`data:${mime};base64,${b64}`,detail:'high'});
+   continue;
+  }
+  const fd=new FormData();fd.append('purpose','user_data');fd.append('file',new Blob([f.buffer],{type:mime}),f.originalname||'score-page.pdf');
   const fr=await fetch('https://api.openai.com/v1/files',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`},body:fd});
-  const fj=await fr.json();if(!fr.ok)throw Error(fj?.error?.message||`Could not upload ${f.originalname||'score image'} for visual transcription.`);
+  const fj=await fr.json();if(!fr.ok)throw Error(fj?.error?.message||`Could not upload ${f.originalname||'score file'} for visual transcription.`);
   fileIds.push(fj.id);
+  sourceContent.push({type:'input_file',file_id:fj.id});
  }
  const profileRules=profile==='historical'?`HISTORICAL / EARLY-MUSIC PROFILE:\n- Expect scans, uneven print, old fonts, unusual spacing, C/F/G clefs, breves, long values, proportional signs, repeat signs, old-looking rests and dense chordal writing.\n- Do not mistake hollow noteheads, breve noteheads, mensuration-like signs, clefs, accidentals or old rest shapes for text or printing noise.\n- Encode written values literally. Use <type>breve</type> for breves; use <type>long</type> or <type>maxima</type> when clearly present. Preserve dots and ties.\n- If the notation is modernized early music, still preserve the printed rhythm exactly rather than normalizing it.`:`MODERN ENGRAVING PROFILE:\n- Treat the source as conventional modern staff notation while preserving all written pitches, rhythms, clefs, rests, ties, repeats and voices.`;
  const textRule=musicOnly?`MUSIC-ONLY RULE (MANDATORY): exclude ALL lyrics, underlay, titles, prose, poetry, verse blocks, movement labels, page numbers, captions, editorial footnotes and other non-musical text. Do not put them into <lyric>, <credit>, <words>, <direction>, part names, or metadata. Only musical notation and neutral generated part names such as Part 1 / Staff 1 may appear.`:`Text may be retained only when it is structurally necessary to the music.`;
  const fileOrder=files.map((f,i)=>`${i+1}. ${f.originalname||`image ${i+1}`}`).join('\n');
  const segmentationRule=segmented?`\nSYSTEM-CROP INPUT:\n- The attachments have already been cropped to individual printed music systems by the browser, in page/top-to-bottom order. Treat each crop as a complete system region, not as a whole page.\n- Do not invent material between crops. Preserve continuity across successive crops.\n- Use the repeated staff order in each system to maintain stable source parts (top staff stays the top source part, etc.).\n- Because prose/lyrics outside the staff systems have been removed, concentrate on exact staff positions, barlines, accidentals and durations.`:'';
  const prompt=`You are a literal optical music recognition engine. Convert ALL attached printed music files into ONE continuous valid MusicXML 4.0 score-partwise document. Return ONLY XML, no Markdown. The attachments are consecutive source pages/images in this exact order:\n${fileOrder}\n\n${textRule}\n\n${profileRules}${segmentationRule}\n\nACCURACY RULES — THESE OVERRIDE GUESSING:\n1. First locate every music system and every staff. Ignore all pixels outside music systems when Music-only mode is active.\n2. Read EACH STAFF independently before combining anything. Never infer harmony from neighboring staves. A note pitch must come from its vertical staff position plus the active clef/key/accidental context.\n3. For every measure, explicitly account for every printed notehead/rest and its duration. Chords require vertically aligned noteheads at the same onset. Do not create isolated notes, ornaments, accidentals, rests, or chords unless they are visibly present.\n4. Preserve each source staff/part separately and track the same staff across systems/pages. DO NOT collapse a multi-staff source into a keyboard reduction.\n5. Detect barlines and measures first, then transcribe measure-by-measure. Preserve every visible pitch, accidental, clef, key signature, meter/mensuration-equivalent sign, rest, beam, tie, augmentation dot, pickup, repeat and ending.\n6. Use separate <voice> values for simultaneous independent rhythms. Use correct MusicXML <backup>/<forward> so each voice has its literal measure-relative onset.\n7. Full-measure rests occupy exactly one measure. Never use one rest to span several measures.\n8. When uncertain about a symbol, do NOT invent a plausible note. Prefer an explicit rest only if a rest is actually visible; otherwise keep the surrounding measure structure conservative.\n9. Output literal SOURCE TRANSCRIPTION only. Do not transpose, octave-fold, condense, harmonize, simplify or keyboard-arrange it.\n10. Multiple uploaded images are consecutive pages/regions of the SAME score unless the notation itself clearly proves otherwise. Preserve continuity between them.\n\nSELF-CHECK BEFORE ANSWERING:\n- Re-scan each system from left to right and compare the MusicXML measure-by-measure against the image.\n- Check every pitch against clef + staff position, especially ledger-line notes.\n- Check every accidental and chord note individually.\n- Check each voice's duration sum against the printed meter.\n- Dense source measures must not become empty; blank source measures must not gain invented notes.\n- Do not output any textual/lyric material when Music-only is on.`;
- const sourceContent=fileIds.map(id=>({type:'input_file',file_id:id}));
  sourceContent.push({type:'input_text',text:prompt});
  const rr=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},body:JSON.stringify({model,input:[{role:'user',content:sourceContent}],reasoning:{effort:'high'},max_output_tokens:96000})});
  const rj=await rr.json();if(!rr.ok)throw Error(rj?.error?.message||'Visual transcription failed.');
@@ -655,7 +664,9 @@ async function runVisualTranscription(jobReq){
 
  if(verify){
   const audit=`Audit the draft MusicXML below against EVERY attached source image/PDF at symbol level, then return a COMPLETE corrected MusicXML 4.0 score-partwise document only. Do not explain changes.\n\nThis is a correction pass, not a creative transcription. Remove hallucinated/random notes. Correct every visibly mismatched pitch, octave, accidental, chord member, rest, onset and duration. Preserve source staff separation. Respect clefs and key signatures measure by measure. Check each measure from left to right against the pixels. Do not add lyrics or prose. Keep breves/long values literal. Ensure independent voices use <backup>/<forward> correctly. If the draft and source disagree, the SOURCE IMAGE wins.\n\nDRAFT MUSICXML:\n${xml}`;
-  const verifyContent=fileIds.map(id=>({type:'input_file',file_id:id}));
+  // Reuse the same visual/file inputs for verification. Images stay as input_image
+  // data URLs; PDFs remain uploaded input_file references.
+  const verifyContent=sourceContent.filter(x=>x.type!=='input_text').map(x=>({...x}));
   verifyContent.push({type:'input_text',text:audit});
   const vr=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},body:JSON.stringify({model,input:[{role:'user',content:verifyContent}],reasoning:{effort:'high'},max_output_tokens:96000})});
   const vj=await vr.json();if(!vr.ok)throw Error(vj?.error?.message||'OMR verification pass failed.');
