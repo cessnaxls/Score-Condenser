@@ -7,7 +7,6 @@ import JSZip from 'jszip';
 import createVerovioModule from 'verovio/wasm';
 import { VerovioToolkit } from 'verovio/esm';
 import PDFDocument from 'pdfkit';
-import SVGtoPDF from 'svg-to-pdfkit';
 
 const app=express();
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
@@ -363,31 +362,22 @@ function engravingGeometry(layout={}){const landscape=layout.orientation==='land
 function engravingOptions(layout={}){const {w,h}=engravingGeometry(layout),scale=Number(layout.scale||42),spacing=Number(layout.noteSpacing||1),stretch=Number(layout.barStretch||1),staff=Number(layout.staffSpacing||12),system=Number(layout.systemSpacing||10),margin=Number(layout.margin||60);return{pageWidth:w,pageHeight:h,pageMarginTop:margin,pageMarginBottom:margin,pageMarginLeft:margin,pageMarginRight:margin,scale,breaks:'auto',header:'auto',footer:'none',font:'Leipzig',spacingLinear:.25*spacing*stretch,spacingNonLinear:.6*spacing,spacingStaff:staff,spacingSystem:system,justifyVertically:false,systemDivider:'none'};}
 async function renderScore(body){const {parts,selected,meta={},layout={},transcription={}}=body;const xml=makeReduction(parts,selected,meta,transcription);const tk=await getToolkit();tk.setOptions(engravingOptions(layout));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));return{xml,pages,layout};}
 app.post('/api/engrave',async(req,res)=>{try{const r=await renderScore(req.body);res.json({pages:r.pages,musicxml:r.xml,pageCount:r.pages.length});}catch(e){console.error(e);res.status(400).json({error:e.message})}});
-function svgGeometry(svg){
- const m=svg.match(/viewBox=["']\s*([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s*["']/i);
- if(!m)return null;return{x:+m[1],y:+m[2],w:+m[3],h:+m[4]};
-}
-function normalizeSvgForPdf(svg,vb){
- // svg-to-pdfkit otherwise mixes Verovio's pixel-sized root with PDF points. Make the
- // SVG's intrinsic dimensions equal to its viewBox, then apply exactly one explicit scale.
- return svg.replace(/<svg\b([^>]*)>/i,(all,attrs)=>{
-   attrs=attrs.replace(/\s(?:width|height)=["'][^"']*["']/gi,'');
-   return `<svg${attrs} width="${vb.w}" height="${vb.h}">`;
- });
-}
 app.post('/api/pdf',async(req,res)=>{try{
- // PDF is a printout of the ALREADY RENDERED preview. Do not regenerate MusicXML and do
- // not invoke Verovio here: the SVG strings received are exactly the pages visible on screen.
+ // PDF contains raster page images only. The browser rasterizes the exact rendered preview
+ // page at Verovio's full page pixel dimensions; this endpoint simply places that PNG on
+ // the matching physical PDF page. No SVG parser/converter is involved here.
  const pages=Array.isArray(req.body?.pages)?req.body.pages:[],layout=req.body?.layout||{};
  if(!pages.length)throw Error('Preview the score before downloading the PDF.');
  const g=engravingGeometry(layout);
- res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition','attachment; filename="keyboard-reduction.pdf"');
- const doc=new PDFDocument({autoFirstPage:false,compress:true,info:{Title:String(req.body?.title||'Keyboard reduction')}});doc.pipe(res);
- for(const svg of pages){
+ res.setHeader('Content-Type','application/pdf');
+ res.setHeader('Content-Disposition','attachment; filename="keyboard-reduction.pdf"');
+ const doc=new PDFDocument({autoFirstPage:false,compress:true,info:{Title:String(req.body?.title||'Keyboard reduction')}});
+ doc.pipe(res);
+ for(const dataUrl of pages){
+  if(typeof dataUrl!=='string'||!dataUrl.startsWith('data:image/png;base64,'))throw Error('PDF page is not a rasterized PNG preview.');
+  const png=Buffer.from(dataUrl.slice(dataUrl.indexOf(',')+1),'base64');
   doc.addPage({size:[g.pw,g.ph],margin:0});
-  // svg-to-pdfkit performs one fit from the SVG's own viewBox into the physical page.
-  // No transforms, no second layout pass, no reinterpretation of Verovio coordinates.
-  SVGtoPDF(doc,svg,0,0,{width:g.pw,height:g.ph,preserveAspectRatio:'xMidYMid meet'});
+  doc.image(png,0,0,{width:g.pw,height:g.ph});
  }
  doc.end();
 }catch(e){console.error(e);if(!res.headersSent)res.status(400).json({error:e.message});else res.end();}});
