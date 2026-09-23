@@ -298,12 +298,23 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
    assertEventFits(e,targetQ,m,st.name);
    emittedSignature.push([m,Number(e.start||0).toFixed(6),Number(e.dur||0).toFixed(6),Number(e.midi),String(e.step||''),Number(e.alter||0),Number(e.octave||0)].join('|'));
    const staff=e.sourceStaff||(e.midi>=60?1:2),stem=stems.get(`${st.voiceNo}|${m}|${e.start}`)||'';
-   // Preserve source beam families. Unbeamed notes may be packed by stem role; beamed notes
-   // retain source-stream ownership so begin/continue/end can never be orphaned.
+   const literal=!!intelligence.literal;
+   const strength=String(intelligence.strength||'balanced');
    const hasBeam=(e.beams||[]).length>0;
-   const owner=hasBeam?`src${st.voiceNo}`:(stem||`src${st.voiceNo}`);
-   const key=[staff,Number(e.start||0).toFixed(6),Number(e.dur||0).toFixed(6),owner,beamFamilyKey(e)].join('|');
-   if(!chordGroups.has(key))chordGroups.set(key,{staff,start:Number(e.start||0),dur:Number(e.dur||0),stem,owner,sourceVoice:st.voiceNo,beams:e.beams||[],notes:[]});
+   // Literal mode stays source-faithful except that simultaneous, rhythmically identical
+   // pitches with the same graphical stem role may form a real chord. Intelligent mode is
+   // deliberately different: source voice identity is discarded for note ownership and
+   // compatible notes are packed into the two keyboard stem roles. Beams are regenerated
+   // after packing, so a source beam can never prevent otherwise valid condensation.
+   let role=stem;
+   if(!role && !literal){
+     if(strength==='compact') role=staff===1?'up':'down';
+     else if(strength==='balanced') role=staff===1?(e.midi>=67?'up':'down'):(e.midi>=53?'up':'down');
+   }
+   const owner=literal?(hasBeam?`src${st.voiceNo}`:(role||`src${st.voiceNo}`)):(role||`src${st.voiceNo}`);
+   const beamKey=literal?beamFamilyKey(e):'rebeam';
+   const key=[staff,Number(e.start||0).toFixed(6),Number(e.dur||0).toFixed(6),owner,beamKey].join('|');
+   if(!chordGroups.has(key))chordGroups.set(key,{staff,start:Number(e.start||0),dur:Number(e.dur||0),stem:role,owner,sourceVoice:st.voiceNo,beams:literal?(e.beams||[]):[],notes:[]});
    chordGroups.get(key).notes.push(e);
   }
 
@@ -314,11 +325,17 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
   const groups=[...chordGroups.values()].sort((a,b)=>a.staff-b.staff||a.start-b.start||b.dur-a.dur||a.owner.localeCompare(b.owner));
   for(const g of groups){
    const lanes=byStaff.get(g.staff);let lane=null;
-   // Keep beam-bearing material in a stable source-owned lane.
-   if((g.beams||[]).length) lane=lanes.find(l=>l.owner===g.owner && l.end<=g.start+.000001);
-   if(!lane) lane=lanes.find(l=>l.owner===g.owner && l.end<=g.start+.000001);
-   if(!lane) lane=lanes.find(l=>l.end<=g.start+.000001 && !(g.beams||[]).length);
-   if(!lane){lane={staff:g.staff,owner:g.owner,end:0,events:[]};lanes.push(lane);}
+   const literal=!!intelligence.literal;
+   // In intelligent mode, up/down are persistent engraving layers. Prefer the matching
+   // layer first, then any free layer. Only create an additional lane when independent
+   // durations genuinely overlap and therefore cannot legally share a MusicXML voice.
+   lane=lanes.find(l=>l.owner===g.owner && l.end<=g.start+.000001);
+   if(!lane && !literal && (g.owner==='up'||g.owner==='down')){
+     lane=lanes.find(l=>l.role===g.owner && l.end<=g.start+.000001);
+   }
+   if(!lane) lane=lanes.find(l=>l.end<=g.start+.000001 && (literal?!(g.beams||[]).length:true));
+   if(!lane){lane={staff:g.staff,owner:g.owner,role:(g.owner==='up'||g.owner==='down')?g.owner:'',end:0,events:[]};lanes.push(lane);}
+   if(!lane.role && (g.owner==='up'||g.owner==='down'))lane.role=g.owner;
    lane.events.push(g);lane.end=Math.max(lane.end,g.start+g.dur);
   }
 
