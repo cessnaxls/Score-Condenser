@@ -35,11 +35,13 @@ function parseXML(buf){
  const cleanComposer=dateMatch?composer.replace(dateMatch,'').replace(/[(),;\s]+$/,'').trim():composer;
  const parts=[]; let globalMeasures=0;
  for(const p of arr(score.part)){
-  const voices=new Set(), events=[]; let divisions=1, beats=4, beatType=4, fifths=0, mi=0;
+  const voices=new Set(), events=[], measureMeta=[]; let divisions=1, beats=4, beatType=4, fifths=0, mi=0;
   for(const m of arr(p.measure)){
    if(m.attributes?.divisions) divisions=Number(m.attributes.divisions)||divisions;
    if(m.attributes?.time){beats=Number(m.attributes.time.beats)||beats;beatType=Number(m.attributes.time['beat-type'])||beatType;}
    if(m.attributes?.key?.fifths!=null) fifths=Number(m.attributes.key.fifths)||0;
+   const nominalQ=beats*(4/beatType);
+   measureMeta[mi]={beats,beatType,fifths,nominalQ};
    let cursor=0,lastStart=0;
    for(const n of arr(m.note)){
     const durDiv=Number(n.duration||0),dur=durDiv/divisions,v=String(n.voice||'1'); voices.add(v);
@@ -56,7 +58,7 @@ function parseXML(buf){
    mi++;
   }
   globalMeasures=Math.max(globalMeasures,mi);
-  parts.push({id:String(p['@_id']),name:names[p['@_id']]||String(p['@_id']),voices:[...voices].sort(),events,meta:{beats,beatType,fifths,measures:mi}});
+  parts.push({id:String(p['@_id']),name:names[p['@_id']]||String(p['@_id']),voices:[...voices].sort(),events,meta:{beats,beatType,fifths,measures:mi,measureMeta}});
  }
  return {kind:'musicxml',parts,measures:globalMeasures,metadata:{title,subtitle,collection:source||rights,composer:cleanComposer,dates:dateMatch}};
 }
@@ -212,15 +214,30 @@ function literalRestXML(e,voiceNo,div,staff){
 // Literal mode is intentionally archival: every source rest survives with its original onset,
 // duration and source-voice identity. We use <forward> only to position that source material;
 // no rests are invented, removed, combined or split here.
+// Rhythmic grid: every emitted lane is reconciled against one authoritative duration.
+// Quarter-note units are used internally. A pickup/short final bar keeps its real source span;
+// ordinary measures use the notated meter duration.
+function sourceMeasureEnd(streams,m){
+ let end=0;for(const s of streams)for(const e of s.events.filter(e=>(e.measure||0)===m))end=Math.max(end,Number(e.start||0)+Number(e.dur||0));return end;
+}
+function measureTiming(first,streams,m,maxM){
+ const mm=first?.meta?.measureMeta?.[m]||{},beats=Number(mm.beats||first?.meta?.beats||4),beatType=Number(mm.beatType||first?.meta?.beatType||4),nominalQ=beats*(4/beatType),sourceEnd=sourceMeasureEnd(streams,m);
+ const shortEdge=(m===0||m===maxM)&&sourceEnd>.0001&&sourceEnd<nominalQ-.0001;
+ return {beats,beatType,nominalQ,targetQ:shortEdge?sourceEnd:nominalQ};
+}
+function assertEventFits(e,targetQ,m,label){const start=Number(e.start||0),end=start+Number(e.dur||0);if(start<-.0001||end>targetQ+.0001)throw Error(`Rhythmic validation failed in measure ${m+1}, ${label}: event ${start.toFixed(3)}–${end.toFixed(3)} exceeds ${targetQ.toFixed(3)} beats.`);}
+function padForward(cursor,targetQ,div,voiceNo,staff){return cursor<targetQ-.0001?forwardXML(targetQ-cursor,div,voiceNo,staff):'';}
 function makeLiteralReduction(parts,selected,meta={}){
  const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
- const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],beats=Number(first?.meta?.beats||4),beatType=Number(first?.meta?.beatType||4),fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
+ const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
  let measures='';
  for(let m=0;m<=maxM;m++){
+  const timing=measureTiming(first,streams,m,maxM),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
   let body='';
   for(let si=0;si<streams.length;si++){
    const stream=streams[si],voiceNo=stream.voiceNo,defaultStaff=inferredStreamStaff(stream);
    const es=stream.events.filter(e=>(e.measure||0)===m).sort((a,b)=>Number(a.start||0)-Number(b.start||0)||(a.isRest?1:0)-(b.isRest?1:0));
+   es.forEach(e=>assertEventFits(e,targetQ,m,stream.name));
    let cursor=0,lastStaff=defaultStaff;
    for(let i=0;i<es.length;i++){
     const e=es[i],start=Number(e.start||0),staff=e.sourceStaff||(!e.isRest?(e.midi>=60?1:2):lastStaff)||defaultStaff;
@@ -233,10 +250,11 @@ function makeLiteralReduction(parts,selected,meta={}){
      cursor=Math.max(cursor,start+Number(e.dur||0));lastStaff=staff;
     }
    }
-   if(si<streams.length-1 && cursor>0)body+=`<backup><duration>${Math.round(cursor*div)}</duration></backup>`;
+   body+=padForward(cursor,targetQ,div,voiceNo,lastStaff||defaultStaff);cursor=targetQ;
+   if(si<streams.length-1)body+=`<backup><duration>${Math.round(targetQ*div)}</duration></backup>`;
   }
   const attrs=m===0?`<attributes><divisions>${div}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beats}</beats><beat-type>${beatType}</beat-type></time><staves>2</staves><part-symbol>brace</part-symbol><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>F</sign><line>4</line></clef></attributes>`:'';
-  measures+=`<measure number="${m+1}">${attrs}${body}</measure>`;
+  measures+=`<measure number="${m+1}"${targetQ<timing.nominalQ-.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
  }
  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
@@ -258,6 +276,7 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
  }
  let measures='';
  for(let m=0;m<=maxM;m++){
+  const timing=measureTiming(first,streams,m,maxM),beats=timing.beats,beatType=timing.beatType,measureQ=timing.targetQ;
   let body='';
   // Render lanes that actually sound in this measure. A lane silent for a complete measure is
   // represented only when it disappears between two sounding measures; this avoids redundant
@@ -278,7 +297,7 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
     body+=restXML(measureQ,voiceNo,div,lane.staff,{measure:true});cursor=measureQ;
    }else{
     for(let i=0;i<es.length;i++){
-     const g=es[i],start=Number(g.start||0);
+     const g=es[i],start=Number(g.start||0);g.notes.forEach(e=>assertEventFits(e,measureQ,m,lane.key));
      // A gap inside a surviving rhythmic lane is genuine notated silence. Re-group it into
      // conventional rests. <forward> is reserved for XML positioning, never musical silence.
      if(start>cursor+.0001)body+=restRunXML(cursor,start-cursor,voiceNo,div,lane.staff,beats,beatType,measureQ);
@@ -288,13 +307,15 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
     }
     // Preserve a genuine release before the barline when this same logical voice continues
     // later. If the voice actually ends here, don't manufacture a trailing rest just to fill XML.
-    const r=laneRange.get(lane.key);
-    if(cursor<measureQ-.0001 && r && m<r.last)body+=restRunXML(cursor,measureQ-cursor,voiceNo,div,lane.staff,beats,beatType,measureQ),cursor=measureQ;
+    // Every visible intelligent-transcription lane spans the complete rhythmic grid.
+    // Trailing silence is therefore not omitted: it is notated as rests to the barline.
+    if(cursor<measureQ-.0001)body+=restRunXML(cursor,measureQ-cursor,voiceNo,div,lane.staff,beats,beatType,measureQ),cursor=measureQ;
    }
-   if(li<lanes.length-1)body+=`<backup><duration>${Math.round(cursor*div)}</duration></backup>`;
+   if(Math.abs(cursor-measureQ)>.0001)throw Error(`Rhythmic validation failed in measure ${m+1}: lane ${lane.key} totals ${cursor.toFixed(3)} instead of ${measureQ.toFixed(3)} beats.`);
+   if(li<lanes.length-1)body+=`<backup><duration>${Math.round(measureQ*div)}</duration></backup>`;
   }
   const attrs=m===0?`<attributes><divisions>${div}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beats}</beats><beat-type>${beatType}</beat-type></time><staves>2</staves><part-symbol>brace</part-symbol><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>F</sign><line>4</line></clef></attributes>`:'';
-  measures+=`<measure number="${m+1}">${attrs}${body}</measure>`;
+  measures+=`<measure number="${m+1}"${measureQ<timing.nominalQ-.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
  }
  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
