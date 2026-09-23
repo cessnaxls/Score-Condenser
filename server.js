@@ -262,69 +262,101 @@ function makeReduction(parts,selected,meta={},transcription={}){
  return transcription?.intelligent ? makeIntelligentReduction(parts,selected,meta,transcription) : makeLiteralReduction(parts,selected,meta);
 }
 
+function canonicalNoteSignature(streams){
+ const sig=[];
+ for(const st of streams) for(const e of st.events){
+  if(e.isRest)continue;
+  sig.push([Number(e.measure||0),Number(e.start||0).toFixed(6),Number(e.dur||0).toFixed(6),Number(e.midi),String(e.step||''),Number(e.alter||0),Number(e.octave||0)].join('|'));
+ }
+ return sig.sort();
+}
+function beamFamilyKey(e){
+ const beams=(e.beams||[]).map(b=>[Number(b.number||1),String(b.value||'')]);
+ return JSON.stringify(beams);
+}
 function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
- // Intelligent mode is deliberately downstream of the literal rhythmic transcription.
- // It may change note ownership/stems/chords, but NEVER note onset/duration, source rests,
- // or source beam declarations. This keeps the horizontal rhythm identical to literal mode.
+ // Canonical rule: literal import owns rhythm. Intelligent mode may only change engraving
+ // ownership (staff/voice/stem/chord). Pitch, onset and duration are immutable.
  const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
+ const canonical=canonicalNoteSignature(streams);
  const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
- let measures='';
+ let measures='', emittedSignature=[];
  for(let m=0;m<=maxM;m++){
   const timing=measureTiming(first,streams,m,maxM),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
-  let body='', emitted=0;
+  let body='',voiceCounter=0;
+  const stems=stemAssignments(streams,m);
 
-  // NOTE LANES: use the intelligent stem/chord ownership, but retain source beam data.
-  // A cross-source chord is permitted only when onset, duration, stem role AND beam pattern
-  // agree, so intelligent packing cannot rewrite the original beaming.
-  const stems=stemAssignments(streams,m), groups=new Map();
-  const beamSig=e=>JSON.stringify((e.beams||[]).map(b=>[Number(b.number||1),String(b.value||'')]));
+  // First make true simultaneous chord groups. A chord is legal only when onset, duration,
+  // staff, stem-role and beam state agree. Exact duplicate pitches are de-duplicated visually
+  // but still represented in the validation signature below.
+  const chordGroups=new Map();
   for(const st of streams) for(const e of st.events.filter(e=>(e.measure||0)===m&&!e.isRest)){
    assertEventFits(e,targetQ,m,st.name);
-   const staff=e.sourceStaff||(e.midi>=60?1:2),stem=stems.get(`${st.voiceNo}|${m}|${e.start}`)||'',role=stem||`independent-${st.voiceNo}`;
-   const key=[staff,Number(e.start||0).toFixed(5),Number(e.dur||0).toFixed(5),role,beamSig(e)].join('|');
-   if(!groups.has(key))groups.set(key,{staff,start:Number(e.start||0),dur:Number(e.dur||0),stem,sourceVoice:st.voiceNo,notes:[],beams:e.beams||[]});
-   groups.get(key).notes.push(e);
-  }
-  const lanes=new Map();
-  for(const g of groups.values()){
-   const laneKey=`${g.staff}|${g.stem||('v'+g.sourceVoice)}`;
-   if(!lanes.has(laneKey))lanes.set(laneKey,{staff:g.staff,events:[]});
-   lanes.get(laneKey).events.push(g);
-  }
-  for(const lane of lanes.values()){
-   const voiceNo=++emitted,es=lane.events.sort((a,b)=>a.start-b.start||a.dur-b.dur),staff=lane.staff;let cursor=0;
-   for(const g of es){
-    if(g.start>cursor+.0001)body+=forwardXML(g.start-cursor,div,voiceNo,staff);
-    const notes=[...g.notes].sort((a,b)=>a.midi-b.midi);
-    notes.forEach((e,j)=>body+=noteXML(e,voiceNo,div,j>0,j===0?g.stem:'',j===0?g.beams:[]));
-    cursor=Math.max(cursor,g.start+g.dur);
-   }
-   body+=padForward(cursor,targetQ,div,voiceNo,staff);
-   body+=`<backup><duration>${Math.round(targetQ*div)}</duration></backup>`;
+   emittedSignature.push([m,Number(e.start||0).toFixed(6),Number(e.dur||0).toFixed(6),Number(e.midi),String(e.step||''),Number(e.alter||0),Number(e.octave||0)].join('|'));
+   const staff=e.sourceStaff||(e.midi>=60?1:2),stem=stems.get(`${st.voiceNo}|${m}|${e.start}`)||'';
+   // Preserve source beam families. Unbeamed notes may be packed by stem role; beamed notes
+   // retain source-stream ownership so begin/continue/end can never be orphaned.
+   const hasBeam=(e.beams||[]).length>0;
+   const owner=hasBeam?`src${st.voiceNo}`:(stem||`src${st.voiceNo}`);
+   const key=[staff,Number(e.start||0).toFixed(6),Number(e.dur||0).toFixed(6),owner,beamFamilyKey(e)].join('|');
+   if(!chordGroups.has(key))chordGroups.set(key,{staff,start:Number(e.start||0),dur:Number(e.dur||0),stem,owner,sourceVoice:st.voiceNo,beams:e.beams||[],notes:[]});
+   chordGroups.get(key).notes.push(e);
   }
 
-  // REST LANES: every imported rest is emitted verbatim at its original measure-relative
-  // onset and duration. Intelligent mode never deletes, regroups, moves or synthesizes rests.
-  for(const st of streams){
-   const rests=st.events.filter(e=>(e.measure||0)===m&&e.isRest).sort((a,b)=>Number(a.start||0)-Number(b.start||0));
-   if(!rests.length)continue;
-   const voiceNo=++emitted,defaultStaff=inferredStreamStaff(st);let cursor=0,lastStaff=defaultStaff;
+  // Interval-safe lane packing. CRITICAL: an event can enter a lane only if that lane's
+  // previous event has ended. v13 violated this rule; MusicXML then emitted a later-onset
+  // event while the cursor was already beyond it, which made Verovio place it late.
+  const byStaff=new Map([[1,[]],[2,[]]]);
+  const groups=[...chordGroups.values()].sort((a,b)=>a.staff-b.staff||a.start-b.start||b.dur-a.dur||a.owner.localeCompare(b.owner));
+  for(const g of groups){
+   const lanes=byStaff.get(g.staff);let lane=null;
+   // Keep beam-bearing material in a stable source-owned lane.
+   if((g.beams||[]).length) lane=lanes.find(l=>l.owner===g.owner && l.end<=g.start+.000001);
+   if(!lane) lane=lanes.find(l=>l.owner===g.owner && l.end<=g.start+.000001);
+   if(!lane) lane=lanes.find(l=>l.end<=g.start+.000001 && !(g.beams||[]).length);
+   if(!lane){lane={staff:g.staff,owner:g.owner,end:0,events:[]};lanes.push(lane);}
+   lane.events.push(g);lane.end=Math.max(lane.end,g.start+g.dur);
+  }
+
+  // Emit notes. Every lane has its own cursor and is rewound exactly one measure afterward.
+  // Therefore horizontal placement comes only from canonical measure-relative onset.
+  const noteLanes=[...byStaff.get(1),...byStaff.get(2)];
+  for(let li=0;li<noteLanes.length;li++){
+   const lane=noteLanes[li],voiceNo=++voiceCounter,staff=lane.staff;let cursor=0;
+   for(const g of lane.events.sort((a,b)=>a.start-b.start||b.dur-a.dur)){
+    if(g.start<cursor-.0001)throw Error(`Intelligent transcription overlap in measure ${m+1}: onset ${g.start.toFixed(3)} occurs before lane cursor ${cursor.toFixed(3)}.`);
+    if(g.start>cursor+.0001)body+=forwardXML(g.start-cursor,div,voiceNo,staff);
+    const unique=[...new Map(g.notes.sort((a,b)=>a.midi-b.midi).map(n=>[`${n.midi}|${n.step}|${n.alter}|${n.octave}`,n])).values()];
+    unique.forEach((e,j)=>body+=noteXML(e,voiceNo,div,j>0,j===0?g.stem:'',j===0?g.beams:[]));
+    cursor=g.start+g.dur;
+   }
+   body+=padForward(cursor,targetQ,div,voiceNo,staff);
+   if(li<noteLanes.length-1 || streams.some(st=>st.events.some(e=>(e.measure||0)===m&&e.isRest)))body+=`<backup><duration>${Math.round(targetQ*div)}</duration></backup>`;
+  }
+
+  // Preserve every imported rest exactly. They remain source-owned so they cannot perturb
+  // note-lane cursors. This is intentionally conservative even when it creates extra voices.
+  const restStreams=streams.filter(st=>st.events.some(e=>(e.measure||0)===m&&e.isRest));
+  for(let ri=0;ri<restStreams.length;ri++){
+   const st=restStreams[ri],rests=st.events.filter(e=>(e.measure||0)===m&&e.isRest).sort((a,b)=>Number(a.start||0)-Number(b.start||0));
+   const voiceNo=++voiceCounter,defaultStaff=inferredStreamStaff(st);let cursor=0,lastStaff=defaultStaff;
    for(const e of rests){
-    assertEventFits(e,targetQ,m,st.name);
-    const start=Number(e.start||0),staff=e.sourceStaff||lastStaff||defaultStaff;
+    assertEventFits(e,targetQ,m,st.name);const start=Number(e.start||0),staff=e.sourceStaff||lastStaff||defaultStaff;
+    if(start<cursor-.0001)throw Error(`Overlapping source rests in measure ${m+1}, ${st.name}.`);
     if(start>cursor+.0001)body+=forwardXML(start-cursor,div,voiceNo,staff);
-    body+=literalRestXML(e,voiceNo,div,staff);cursor=Math.max(cursor,start+Number(e.dur||0));lastStaff=staff;
+    body+=literalRestXML(e,voiceNo,div,staff);cursor=start+Number(e.dur||0);lastStaff=staff;
    }
    body+=padForward(cursor,targetQ,div,voiceNo,lastStaff);
-   body+=`<backup><duration>${Math.round(targetQ*div)}</duration></backup>`;
+   if(ri<restStreams.length-1)body+=`<backup><duration>${Math.round(targetQ*div)}</duration></backup>`;
   }
-  // Remove the final backup only; all preceding lanes remain independently positioned.
-  body=body.replace(new RegExp(`<backup><duration>${Math.round(targetQ*div)}</duration></backup>$`),'');
   const attrs=m===0?`<attributes><divisions>${div}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beats}</beats><beat-type>${beatType}</beat-type></time><staves>2</staves><part-symbol>brace</part-symbol><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>F</sign><line>4</line></clef></attributes>`:'';
   measures+=`<measure number="${m+1}"${targetQ<timing.nominalQ-.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
  }
+ emittedSignature.sort();
+ if(canonical.length!==emittedSignature.length || canonical.some((v,i)=>v!==emittedSignature[i]))throw Error('Intelligent transcription safety check failed: a note pitch, onset, or duration changed.');
  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
+
 let toolkitPromise;
 async function getToolkit(){if(!toolkitPromise)toolkitPromise=createVerovioModule().then(m=>new VerovioToolkit(m));return toolkitPromise;}
 function engravingGeometry(layout={}){const landscape=layout.orientation==='landscape',base=layout.pageSize==='a4'?{w:2100,h:2970,pw:595.28,ph:841.89}:{w:2159,h:2794,pw:612,ph:792};return landscape?{w:base.h,h:base.w,pw:base.ph,ph:base.pw}:{w:base.w,h:base.h,pw:base.pw,ph:base.ph};}
