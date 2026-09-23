@@ -11,7 +11,7 @@ import SVGtoPDF from 'svg-to-pdfkit';
 
 const app=express();
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
-app.use(express.json({limit:'25mb'})); app.use(express.static('public'));
+app.use(express.json({limit:'60mb'})); app.use(express.static('public'));
 app.get('/health',(_,r)=>r.json({ok:true}));
 const arr=x=>x==null?[]:Array.isArray(x)?x:[x];
 const stepSemi={C:0,D:2,E:4,F:5,G:7,A:9,B:11};
@@ -263,59 +263,65 @@ function makeReduction(parts,selected,meta={},transcription={}){
 }
 
 function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
+ // Intelligent mode is deliberately downstream of the literal rhythmic transcription.
+ // It may change note ownership/stems/chords, but NEVER note onset/duration, source rests,
+ // or source beam declarations. This keeps the horizontal rhythm identical to literal mode.
  const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
- const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],beats=Number(first?.meta?.beats||4),beatType=Number(first?.meta?.beatType||4),fifths=Number(first?.meta?.fifths||0),measureQ=beats*(4/beatType),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
- // Build every measure once, then keep stable lane/voice identities throughout the score.
- const lanesByMeasure=[]; const laneVoiceNos=new Map(); const laneRange=new Map(); let nextVoice=1;
- for(let m=0;m<=maxM;m++){
-  const lanes=condensedLanes(streams,m);lanesByMeasure[m]=lanes;
-  for(const lane of lanes){
-   if(!laneVoiceNos.has(lane.key))laneVoiceNos.set(lane.key,nextVoice++);
-   const r=laneRange.get(lane.key)||{first:m,last:m,staff:lane.staff};r.first=Math.min(r.first,m);r.last=Math.max(r.last,m);laneRange.set(lane.key,r);
-  }
- }
+ const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
  let measures='';
  for(let m=0;m<=maxM;m++){
-  const timing=measureTiming(first,streams,m,maxM),beats=timing.beats,beatType=timing.beatType,measureQ=timing.targetQ;
-  let body='';
-  // Render lanes that actually sound in this measure. A lane silent for a complete measure is
-  // represented only when it disappears between two sounding measures; this avoids redundant
-  // stacked whole-measure rests while preserving a real interruption of an independent voice.
-  const sounding=new Map((lanesByMeasure[m]||[]).map(l=>[l.key,l]));
-  const lanes=[...sounding.values()];
-  for(const [key,r] of laneRange){
-   if(!sounding.has(key) && m>r.first && m<r.last){
-    const prev=(lanesByMeasure[m-1]||[]).some(l=>l.key===key),next=(lanesByMeasure[m+1]||[]).some(l=>l.key===key);
-    if(prev&&next)lanes.push({key,staff:r.staff,events:[],silentMeasure:true});
-   }
+  const timing=measureTiming(first,streams,m,maxM),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
+  let body='', emitted=0;
+
+  // NOTE LANES: use the intelligent stem/chord ownership, but retain source beam data.
+  // A cross-source chord is permitted only when onset, duration, stem role AND beam pattern
+  // agree, so intelligent packing cannot rewrite the original beaming.
+  const stems=stemAssignments(streams,m), groups=new Map();
+  const beamSig=e=>JSON.stringify((e.beams||[]).map(b=>[Number(b.number||1),String(b.value||'')]));
+  for(const st of streams) for(const e of st.events.filter(e=>(e.measure||0)===m&&!e.isRest)){
+   assertEventFits(e,targetQ,m,st.name);
+   const staff=e.sourceStaff||(e.midi>=60?1:2),stem=stems.get(`${st.voiceNo}|${m}|${e.start}`)||'',role=stem||`independent-${st.voiceNo}`;
+   const key=[staff,Number(e.start||0).toFixed(5),Number(e.dur||0).toFixed(5),role,beamSig(e)].join('|');
+   if(!groups.has(key))groups.set(key,{staff,start:Number(e.start||0),dur:Number(e.dur||0),stem,sourceVoice:st.voiceNo,notes:[],beams:e.beams||[]});
+   groups.get(key).notes.push(e);
   }
-  lanes.sort((a,b)=>(a.staff-b.staff)||(laneVoiceNos.get(a.key)-laneVoiceNos.get(b.key)));
-  for(let li=0;li<lanes.length;li++){
-   const lane=lanes[li],voiceNo=laneVoiceNos.get(lane.key),es=lane.events||[];
-   const beamMap=generatedBeams(es,beats,beatType); let cursor=0;
-   if(lane.silentMeasure){
-    body+=restXML(measureQ,voiceNo,div,lane.staff,{measure:true});cursor=measureQ;
-   }else{
-    for(let i=0;i<es.length;i++){
-     const g=es[i],start=Number(g.start||0);g.notes.forEach(e=>assertEventFits(e,measureQ,m,lane.key));
-     // A gap inside a surviving rhythmic lane is genuine notated silence. Re-group it into
-     // conventional rests. <forward> is reserved for XML positioning, never musical silence.
-     if(start>cursor+.0001)body+=restRunXML(cursor,start-cursor,voiceNo,div,lane.staff,beats,beatType,measureQ);
-     const notes=[...g.notes].sort((a,b)=>a.midi-b.midi),beams=beamMap.get(i)||[];
-     notes.forEach((e,j)=>{body+=noteXML(e,voiceNo,div,j>0,j===0?g.stem:'',j===0?beams:[])});
-     cursor=Math.max(cursor,start+Number(g.dur||0));
-    }
-    // Preserve a genuine release before the barline when this same logical voice continues
-    // later. If the voice actually ends here, don't manufacture a trailing rest just to fill XML.
-    // Every visible intelligent-transcription lane spans the complete rhythmic grid.
-    // Trailing silence is therefore not omitted: it is notated as rests to the barline.
-    if(cursor<measureQ-.0001)body+=restRunXML(cursor,measureQ-cursor,voiceNo,div,lane.staff,beats,beatType,measureQ),cursor=measureQ;
-   }
-   if(Math.abs(cursor-measureQ)>.0001)throw Error(`Rhythmic validation failed in measure ${m+1}: lane ${lane.key} totals ${cursor.toFixed(3)} instead of ${measureQ.toFixed(3)} beats.`);
-   if(li<lanes.length-1)body+=`<backup><duration>${Math.round(measureQ*div)}</duration></backup>`;
+  const lanes=new Map();
+  for(const g of groups.values()){
+   const laneKey=`${g.staff}|${g.stem||('v'+g.sourceVoice)}`;
+   if(!lanes.has(laneKey))lanes.set(laneKey,{staff:g.staff,events:[]});
+   lanes.get(laneKey).events.push(g);
   }
+  for(const lane of lanes.values()){
+   const voiceNo=++emitted,es=lane.events.sort((a,b)=>a.start-b.start||a.dur-b.dur),staff=lane.staff;let cursor=0;
+   for(const g of es){
+    if(g.start>cursor+.0001)body+=forwardXML(g.start-cursor,div,voiceNo,staff);
+    const notes=[...g.notes].sort((a,b)=>a.midi-b.midi);
+    notes.forEach((e,j)=>body+=noteXML(e,voiceNo,div,j>0,j===0?g.stem:'',j===0?g.beams:[]));
+    cursor=Math.max(cursor,g.start+g.dur);
+   }
+   body+=padForward(cursor,targetQ,div,voiceNo,staff);
+   body+=`<backup><duration>${Math.round(targetQ*div)}</duration></backup>`;
+  }
+
+  // REST LANES: every imported rest is emitted verbatim at its original measure-relative
+  // onset and duration. Intelligent mode never deletes, regroups, moves or synthesizes rests.
+  for(const st of streams){
+   const rests=st.events.filter(e=>(e.measure||0)===m&&e.isRest).sort((a,b)=>Number(a.start||0)-Number(b.start||0));
+   if(!rests.length)continue;
+   const voiceNo=++emitted,defaultStaff=inferredStreamStaff(st);let cursor=0,lastStaff=defaultStaff;
+   for(const e of rests){
+    assertEventFits(e,targetQ,m,st.name);
+    const start=Number(e.start||0),staff=e.sourceStaff||lastStaff||defaultStaff;
+    if(start>cursor+.0001)body+=forwardXML(start-cursor,div,voiceNo,staff);
+    body+=literalRestXML(e,voiceNo,div,staff);cursor=Math.max(cursor,start+Number(e.dur||0));lastStaff=staff;
+   }
+   body+=padForward(cursor,targetQ,div,voiceNo,lastStaff);
+   body+=`<backup><duration>${Math.round(targetQ*div)}</duration></backup>`;
+  }
+  // Remove the final backup only; all preceding lanes remain independently positioned.
+  body=body.replace(new RegExp(`<backup><duration>${Math.round(targetQ*div)}</duration></backup>$`),'');
   const attrs=m===0?`<attributes><divisions>${div}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beats}</beats><beat-type>${beatType}</beat-type></time><staves>2</staves><part-symbol>brace</part-symbol><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>F</sign><line>4</line></clef></attributes>`:'';
-  measures+=`<measure number="${m+1}"${measureQ<timing.nominalQ-.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
+  measures+=`<measure number="${m+1}"${targetQ<timing.nominalQ-.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
  }
  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
@@ -338,16 +344,18 @@ function normalizeSvgForPdf(svg,vb){
  });
 }
 app.post('/api/pdf',async(req,res)=>{try{
- const r=await renderScore(req.body),g=engravingGeometry(r.layout);
+ // PDF is a printout of the ALREADY RENDERED preview. Do not regenerate MusicXML and do
+ // not invoke Verovio here: the SVG strings received are exactly the pages visible on screen.
+ const pages=Array.isArray(req.body?.pages)?req.body.pages:[],layout=req.body?.layout||{};
+ if(!pages.length)throw Error('Preview the score before downloading the PDF.');
+ const g=engravingGeometry(layout);
  res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition','attachment; filename="keyboard-reduction.pdf"');
- const doc=new PDFDocument({autoFirstPage:false,compress:true,info:{Title:String(req.body?.meta?.title||'Keyboard reduction'),Author:String(req.body?.meta?.composer||'')}});doc.pipe(res);
- for(const raw of r.pages){
-   doc.addPage({size:[g.pw,g.ph],margin:0});
-   const vb=svgGeometry(raw)||{x:0,y:0,w:g.w,h:g.h},svg=normalizeSvgForPdf(raw,vb);
-   const scale=Math.min(g.pw/vb.w,g.ph/vb.h),drawW=vb.w*scale,drawH=vb.h*scale,x=(g.pw-drawW)/2,y=(g.ph-drawH)/2;
-   doc.save();doc.translate(x,y);doc.scale(scale);doc.translate(-vb.x,-vb.y);
-   SVGtoPDF(doc,svg,0,0,{assumePt:true,preserveAspectRatio:'none'});
-   doc.restore();
+ const doc=new PDFDocument({autoFirstPage:false,compress:true,info:{Title:String(req.body?.title||'Keyboard reduction')}});doc.pipe(res);
+ for(const svg of pages){
+  doc.addPage({size:[g.pw,g.ph],margin:0});
+  // svg-to-pdfkit performs one fit from the SVG's own viewBox into the physical page.
+  // No transforms, no second layout pass, no reinterpretation of Verovio coordinates.
+  SVGtoPDF(doc,svg,0,0,{width:g.pw,height:g.ph,preserveAspectRatio:'xMidYMid meet'});
  }
  doc.end();
 }catch(e){console.error(e);if(!res.headersSent)res.status(400).json({error:e.message});else res.end();}});
