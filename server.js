@@ -47,7 +47,9 @@ function parseXML(buf){
     if(n.pitch){
       const step=String(n.pitch.step),alt=Number(n.pitch.alter||0),oct=Number(n.pitch.octave),midi=(oct+1)*12+stepSemi[step]+alt;
       const beams=arr(n.beam).map(b=>typeof b==='object'?{number:Number(b['@_number']||1),value:String(b['#text']||'')}:{number:1,value:String(b)}).filter(b=>b.value);
-      events.push({voice:v,midi,step,alter:alt,octave:oct,measure:mi,start,dur:Math.max(dur,.0625),type:String(n.type||''),dot:n.dot!==undefined,beams});
+      events.push({voice:v,midi,step,alter:alt,octave:oct,measure:mi,start,dur:Math.max(dur,.0625),type:String(n.type||''),dot:n.dot!==undefined,beams,sourceStaff:Number(n.staff||0)||0,isRest:false});
+    } else if(n.rest!==undefined && dur>0){
+      events.push({voice:v,isRest:true,measure:mi,start,dur,type:String(n.type||''),dot:n.dot!==undefined,sourceStaff:Number(n.staff||0)||0,measureRest:typeof n.rest==='object'&&String(n.rest?.['@_measure']||'')==='yes'});
     }
     if(n.chord===undefined)cursor+=dur;
    }
@@ -99,7 +101,7 @@ function restRunXML(start,q,voiceNo,div,staff,beats,beatType,measureQ){
 }
 function stemAssignments(streams,m){
  const map=new Map(),groups=new Map();
- for(const s of streams) for(const e of s.events.filter(e=>(e.measure||0)===m)){
+ for(const s of streams) for(const e of s.events.filter(e=>(e.measure||0)===m && !e.isRest)){
    const staff=e.midi>=60?1:2,key=`${staff}|${Number(e.start||0).toFixed(5)}`;
    if(!groups.has(key))groups.set(key,[]);groups.get(key).push({s,e});
  }
@@ -169,7 +171,7 @@ function forwardXML(q,div,voiceNo,staff){if(q<=.0001)return '';return `<forward>
 // doubled coincident stems and lets Verovio apply normal chord notehead displacement.
 function condensedLanes(streams,m){
  const stems=stemAssignments(streams,m), raw=[];
- for(const s of streams) for(const e of s.events.filter(e=>(e.measure||0)===m)){
+ for(const s of streams) for(const e of s.events.filter(e=>(e.measure||0)===m && !e.isRest)){
    const staff=e.midi>=60?1:2, stem=stems.get(`${s.voiceNo}|${m}|${e.start}`)||'';
    raw.push({...e,sourceVoice:s.voiceNo,staff,stem});
  }
@@ -195,7 +197,54 @@ function condensedLanes(streams,m){
  return [...laneMap.entries()].map(([key,events])=>({key,staff:events[0].staff,events:events.sort((a,b)=>a.start-b.start||a.midi-b.midi)}));
 }
 
-function makeReduction(parts,selected,meta={}){
+function inferredStreamStaff(stream){
+ const notes=stream.events.filter(e=>!e.isRest && Number.isFinite(e.midi));
+ if(!notes.length)return 1;
+ const avg=notes.reduce((a,e)=>a+e.midi,0)/notes.length;
+ return avg>=60?1:2;
+}
+function literalRestXML(e,voiceNo,div,staff){
+ const q=Number(e.dur||0); if(q<=.0001)return '';
+ if(e.measureRest)return restXML(q,voiceNo,div,staff,{measure:true});
+ const type=e.type||typeFor(q),dots=e.dot?'<dot/>':'';
+ return `<note><rest/><duration>${Math.max(1,Math.round(q*div))}</duration><voice>${voiceNo}</voice><type>${esc(type)}</type>${dots}<staff>${staff}</staff></note>`;
+}
+// Literal mode is intentionally archival: every source rest survives with its original onset,
+// duration and source-voice identity. We use <forward> only to position that source material;
+// no rests are invented, removed, combined or split here.
+function makeLiteralReduction(parts,selected,meta={}){
+ const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
+ const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],beats=Number(first?.meta?.beats||4),beatType=Number(first?.meta?.beatType||4),fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
+ let measures='';
+ for(let m=0;m<=maxM;m++){
+  let body='';
+  for(let si=0;si<streams.length;si++){
+   const stream=streams[si],voiceNo=stream.voiceNo,defaultStaff=inferredStreamStaff(stream);
+   const es=stream.events.filter(e=>(e.measure||0)===m).sort((a,b)=>Number(a.start||0)-Number(b.start||0)||(a.isRest?1:0)-(b.isRest?1:0));
+   let cursor=0,lastStaff=defaultStaff;
+   for(let i=0;i<es.length;i++){
+    const e=es[i],start=Number(e.start||0),staff=e.sourceStaff||(!e.isRest?(e.midi>=60?1:2):lastStaff)||defaultStaff;
+    if(start>cursor+.0001)body+=forwardXML(start-cursor,div,voiceNo,staff);
+    if(e.isRest){body+=literalRestXML(e,voiceNo,div,staff);cursor=Math.max(cursor,start+Number(e.dur||0));}
+    else{
+     const same=es.filter(x=>!x.isRest&&Math.abs(Number(x.start||0)-start)<.0001&&Math.abs(Number(x.dur||0)-Number(e.dur||0))<.0001&&((x.sourceStaff||(x.midi>=60?1:2))===staff));
+     if(same[0]!==e)continue;
+     const stem='';same.sort((a,b)=>a.midi-b.midi).forEach((n,j)=>body+=noteXML(n,voiceNo,div,j>0,stem,j===0?n.beams:[]));
+     cursor=Math.max(cursor,start+Number(e.dur||0));lastStaff=staff;
+    }
+   }
+   if(si<streams.length-1 && cursor>0)body+=`<backup><duration>${Math.round(cursor*div)}</duration></backup>`;
+  }
+  const attrs=m===0?`<attributes><divisions>${div}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beats}</beats><beat-type>${beatType}</beat-type></time><staves>2</staves><part-symbol>brace</part-symbol><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>F</sign><line>4</line></clef></attributes>`:'';
+  measures+=`<measure number="${m+1}">${attrs}${body}</measure>`;
+ }
+ return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
+}
+function makeReduction(parts,selected,meta={},transcription={}){
+ return transcription?.intelligent ? makeIntelligentReduction(parts,selected,meta,transcription) : makeLiteralReduction(parts,selected,meta);
+}
+
+function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
  const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
  const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],beats=Number(first?.meta?.beats||4),beatType=Number(first?.meta?.beatType||4),fifths=Number(first?.meta?.fifths||0),measureQ=beats*(4/beatType),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
  // Build every measure once, then keep stable lane/voice identities throughout the score.
@@ -253,7 +302,7 @@ let toolkitPromise;
 async function getToolkit(){if(!toolkitPromise)toolkitPromise=createVerovioModule().then(m=>new VerovioToolkit(m));return toolkitPromise;}
 function engravingGeometry(layout={}){const landscape=layout.orientation==='landscape',base=layout.pageSize==='a4'?{w:2100,h:2970,pw:595.28,ph:841.89}:{w:2159,h:2794,pw:612,ph:792};return landscape?{w:base.h,h:base.w,pw:base.ph,ph:base.pw}:{w:base.w,h:base.h,pw:base.pw,ph:base.ph};}
 function engravingOptions(layout={}){const {w,h}=engravingGeometry(layout),scale=Number(layout.scale||42),spacing=Number(layout.noteSpacing||1),stretch=Number(layout.barStretch||1),staff=Number(layout.staffSpacing||12),system=Number(layout.systemSpacing||10),margin=Number(layout.margin||60);return{pageWidth:w,pageHeight:h,pageMarginTop:margin,pageMarginBottom:margin,pageMarginLeft:margin,pageMarginRight:margin,scale,breaks:'auto',header:'auto',footer:'none',font:'Leipzig',spacingLinear:.25*spacing*stretch,spacingNonLinear:.6*spacing,spacingStaff:staff,spacingSystem:system,justifyVertically:false,systemDivider:'none'};}
-async function renderScore(body){const {parts,selected,meta={},layout={}}=body;const xml=makeReduction(parts,selected,meta);const tk=await getToolkit();tk.setOptions(engravingOptions(layout));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));return{xml,pages,layout};}
+async function renderScore(body){const {parts,selected,meta={},layout={},transcription={}}=body;const xml=makeReduction(parts,selected,meta,transcription);const tk=await getToolkit();tk.setOptions(engravingOptions(layout));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));return{xml,pages,layout};}
 app.post('/api/engrave',async(req,res)=>{try{const r=await renderScore(req.body);res.json({pages:r.pages,musicxml:r.xml,pageCount:r.pages.length});}catch(e){console.error(e);res.status(400).json({error:e.message})}});
 function svgGeometry(svg){
  const m=svg.match(/viewBox=["']\s*([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s*["']/i);
