@@ -138,6 +138,7 @@ function generatedBeams(es,beats,beatType){
      if(!beamable(cur)||!sameStaff(e,cur))break;
      if(Number(cur.start||0)>=groupEnd-1e-7)break;
      if(Math.abs((Number(prev.start||0)+Number(prev.dur||0))-Number(cur.start||0))>.001)break;
+     if(j-i>=4)break; // Never beam more than four consecutive notes in one group.
      j++;
    }
    if(j-i>=2){
@@ -258,7 +259,11 @@ function makeLiteralReduction(parts,selected,meta={}){
  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
 function makeReduction(parts,selected,meta={},transcription={}){
- return transcription?.intelligent ? makeIntelligentReduction(parts,selected,meta,transcription) : makeLiteralReduction(parts,selected,meta);
+ // Literal mode now uses the same canonical onset/lane emitter as Intelligent mode so
+ // simultaneous compatible pitches are true chords in both modes. Imported rests remain
+ // source-owned and 100% preserved. Intelligent mode is still the place for future packing
+ // heuristics, but neither mode gets a separate rhythmic/beaming pipeline.
+ return makeIntelligentReduction(parts,selected,meta,{...transcription,literal:!transcription?.intelligent});
 }
 
 function canonicalNoteSignature(streams){
@@ -322,11 +327,17 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
   const noteLanes=[...byStaff.get(1),...byStaff.get(2)];
   for(let li=0;li<noteLanes.length;li++){
    const lane=noteLanes[li],voiceNo=++voiceCounter,staff=lane.staff;let cursor=0;
-   for(const g of lane.events.sort((a,b)=>a.start-b.start||b.dur-a.dur)){
+   const ordered=lane.events.sort((a,b)=>a.start-b.start||b.dur-a.dur);
+   // Beaming is generated only after final lane assignment. This prevents orphan beams and
+   // imposes the edition rule that no eighth/sixteenth beam group exceeds four notes.
+   const beamEvents=ordered.map(g=>({start:g.start,dur:g.dur,midi:g.notes[0]?.midi??60}));
+   const laneBeams=generatedBeams(beamEvents,beats,beatType);
+   for(let gi=0;gi<ordered.length;gi++){
+    const g=ordered[gi];
     if(g.start<cursor-.0001)throw Error(`Intelligent transcription overlap in measure ${m+1}: onset ${g.start.toFixed(3)} occurs before lane cursor ${cursor.toFixed(3)}.`);
     if(g.start>cursor+.0001)body+=forwardXML(g.start-cursor,div,voiceNo,staff);
     const unique=[...new Map(g.notes.sort((a,b)=>a.midi-b.midi).map(n=>[`${n.midi}|${n.step}|${n.alter}|${n.octave}`,n])).values()];
-    unique.forEach((e,j)=>body+=noteXML(e,voiceNo,div,j>0,j===0?g.stem:'',j===0?g.beams:[]));
+    unique.forEach((e,j)=>body+=noteXML(e,voiceNo,div,j>0,j===0?g.stem:'',j===0?(laneBeams.get(gi)||[]):[]));
     cursor=g.start+g.dur;
    }
    body+=padForward(cursor,targetQ,div,voiceNo,staff);
@@ -373,9 +384,14 @@ app.post('/api/pdf',async(req,res)=>{try{
  res.setHeader('Content-Disposition','attachment; filename="keyboard-reduction.pdf"');
  const doc=new PDFDocument({autoFirstPage:false,compress:true,info:{Title:String(req.body?.title||'Keyboard reduction')}});
  doc.pipe(res);
- for(const dataUrl of pages){
-  if(typeof dataUrl!=='string'||!dataUrl.startsWith('data:image/png;base64,'))throw Error('PDF page is not a rasterized PNG preview.');
-  const png=Buffer.from(dataUrl.slice(dataUrl.indexOf(',')+1),'base64');
+ for(const page of pages){
+  let b64='';
+  if(typeof page==='string'&&page.startsWith('data:image/png;base64,'))b64=page.slice(page.indexOf(',')+1);
+  else if(page&&page.mime==='image/png'&&typeof page.base64==='string')b64=page.base64;
+  else throw Error('PDF page rasterization did not produce PNG data.');
+  const png=Buffer.from(b64,'base64');
+  // PNG signature validation: 89 50 4E 47 0D 0A 1A 0A
+  if(png.length<8||png.subarray(0,8).toString('hex')!=='89504e470d0a1a0a')throw Error('PDF page rasterization produced invalid PNG data.');
   doc.addPage({size:[g.pw,g.ph],margin:0});
   doc.image(png,0,0,{width:g.pw,height:g.ph});
  }
