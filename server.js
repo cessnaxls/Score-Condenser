@@ -21,21 +21,39 @@ function xmlTagText(block,tag){
  return m?String(m[1]).replace(/<[^>]+>/g,'').trim():'';
 }
 function xmlAttr(attrs,name){const m=String(attrs||'').match(new RegExp(`\\b${name}\\s*=\\s*["']([^"']*)["']`,'i'));return m?m[1]:'';}
+function stripXmlDoctype(raw=''){
+ // MusicXML commonly carries a PUBLIC/DTD declaration. We never need DTD entity
+ // expansion for score import, and disabling it also prevents entity-expansion limits
+ // from being tripped by OMR/source text containing many escaped entities.
+ return String(raw).replace(/<!DOCTYPE[^[]*(?:\[[\s\S]*?\]\s*)?>/gi,'');
+}
+function decodeBasicXmlText(v=''){
+ return String(v).replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'\"').replace(/&apos;/g,"'").replace(/&amp;/g,'&');
+}
+function safeXmlParse(raw,extra={}){
+ return new XMLParser({
+  ignoreAttributes:false,attributeNamePrefix:'@_',parseTagValue:false,preserveOrder:false,
+  // Critical for large OMR scores: do not expand entities. MusicXML structural parsing
+  // does not require it, and this avoids fast-xml-parser's expansion-count guard.
+  processEntities:false,
+  ...extra
+ }).parse(stripXmlDoctype(raw));
+}
 function parseXML(buf){
  const raw=buf.toString();
- const x=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_',parseTagValue:false,preserveOrder:false}).parse(raw);
+ const x=safeXmlParse(raw);
  const score=x['score-partwise']; if(!score) throw Error('This app expects a MusicXML score-partwise document.');
  const names={}; for(const p of arr(score['part-list']?.['score-part'])) { const pn=p['part-name']; names[p['@_id']]=typeof pn==='object'?String(pn?.['#text']||pn?.['display-text']||p['@_id']):String(pn||p['@_id']); }
  const credits=arr(score.credit).flatMap(c=>arr(c?.['credit-words']).map(w=>typeof w==='object'?String(w['#text']||''):String(w))).map(v=>v.trim()).filter(Boolean);
  const creators=arr(score.identification?.creator);
  const composerNode=creators.find(c=>typeof c==='object'&&String(c['@_type']||'').toLowerCase()==='composer')||creators[0];
  const composer=typeof composerNode==='object'?String(composerNode?.['#text']||''):String(composerNode||'');
- const title=String(score.work?.['work-title']||score['movement-title']||credits[0]||'').trim();
- const movement=String(score['movement-title']||'').trim();
+ const title=decodeBasicXmlText(score.work?.['work-title']||score['movement-title']||credits[0]||'').trim();
+ const movement=decodeBasicXmlText(score['movement-title']||'').trim();
  const descriptiveCredit=credits.find(c=>c!==title && c!==composer && !/^\[?an[oó]nimo\]?$/i.test(c))||'';
  const subtitle=movement || descriptiveCredit;
  const rights=arr(score.identification?.rights).map(r=>typeof r==='object'?r['#text']:r).filter(Boolean).join(' · ');
- const source=String(score.identification?.source||'').trim();
+ const source=decodeBasicXmlText(score.identification?.source||'').trim();
  const dateMatch=(composer.match(/(?:c\.?\s*)?\d{3,4}\s*[–—-]\s*(?:c\.?\s*)?\d{2,4}/)||[])[0]||'';
  const cleanComposer=dateMatch?composer.replace(dateMatch,'').replace(/[(),;\s]+$/,'').trim():composer;
 
@@ -121,7 +139,7 @@ function parseXML(buf){
  return {kind:'musicxml',parts,measures:globalMeasures,metadata:{title,subtitle,collection:source||rights,composer:cleanComposer,dates:dateMatch}};
 }
 function parseMidi(buf){const m=new Midi(buf);let max=0;const parts=m.tracks.map((t,i)=>({id:String(i),name:t.name||`Track ${i+1}`,voices:[`ch ${t.channel+1}`],events:t.notes.map(n=>{const s=n.ticks/m.header.ppq,d=n.durationTicks/m.header.ppq;max=Math.max(max,s+d);const pc=n.midi%12,oct=Math.floor(n.midi/12)-1,steps=['C','C','D','D','E','F','F','G','G','A','A','B'],alts=[0,1,0,1,0,0,1,0,1,0,1,0];return{voice:`ch ${t.channel+1}`,midi:n.midi,step:steps[pc],alter:alts[pc],octave:oct,measure:Math.floor(s/4),start:s%4,dur:d,type:''}}),meta:{beats:4,beatType:4,fifths:0,measures:Math.ceil(max/4)}}));return{kind:'midi',parts,measures:Math.ceil(max/4)}}
-async function parseMXL(buf){const zip=await JSZip.loadAsync(buf);let rootPath='';const ce=zip.file('META-INF/container.xml');if(ce){const c=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_'}).parse(await ce.async('string'));const roots=arr(c?.container?.rootfiles?.rootfile);rootPath=roots.find(r=>String(r?.['@_media-type']||'').includes('musicxml'))?.['@_full-path']||roots[0]?.['@_full-path']||'';}if(!rootPath)rootPath=Object.keys(zip.files).find(n=>!zip.files[n].dir&&/\.(musicxml|xml)$/i.test(n)&&!/^META-INF\//i.test(n))||'';if(!rootPath||!zip.file(rootPath))throw Error('This .mxl archive does not contain a readable MusicXML score.');return parseXML(await zip.file(rootPath).async('nodebuffer'));}
+async function parseMXL(buf){const zip=await JSZip.loadAsync(buf);let rootPath='';const ce=zip.file('META-INF/container.xml');if(ce){const c=safeXmlParse(await ce.async('string'));const roots=arr(c?.container?.rootfiles?.rootfile);rootPath=roots.find(r=>String(r?.['@_media-type']||'').includes('musicxml'))?.['@_full-path']||roots[0]?.['@_full-path']||'';}if(!rootPath)rootPath=Object.keys(zip.files).find(n=>!zip.files[n].dir&&/\.(musicxml|xml)$/i.test(n)&&!/^META-INF\//i.test(n))||'';if(!rootPath||!zip.file(rootPath))throw Error('This .mxl archive does not contain a readable MusicXML score.');return parseXML(await zip.file(rootPath).async('nodebuffer'));}
 app.post('/api/import',upload.single('score'),async(req,res)=>{try{if(!req.file)throw Error('Choose a score file first.');const b=req.file.buffer,n=req.file.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise');let parsed;if(midi)parsed=parseMidi(b);else if(zip)parsed=await parseMXL(b);else if(xml)parsed=parseXML(b);else if(/\.midi?$/.test(n))parsed=parseMidi(b);else if(/\.(mxl|musicxml|xml)$/.test(n))parsed=parseXML(b);else throw Error('Unsupported score file.');res.json(parsed);}catch(e){res.status(400).json({error:e.message})}});
 
 function selectedStreams(parts,selected){const streams=[];let v=1,order=0;for(const p of parts)for(const voice of p.voices){const key=`${p.id}|${voice}`;if(selected.includes(key))streams.push({voiceNo:v++,order:order++,name:`${p.name} · ${voice}`,events:p.events.filter(e=>e.voice===voice)});}return streams;}
@@ -567,6 +585,14 @@ function extractMusicXML(text=''){
  if(start<0||end<0)throw Error('Visual transcription did not return a complete MusicXML score.');
  return cleaned.slice(start,end+'</score-partwise>'.length);
 }
+function sanitizeMusicOnlyXML(xml=''){
+ // This is intentionally narrow: remove textual payloads while keeping musical
+ // directions such as dynamics, wedges and metronome marks intact.
+ return String(xml)
+  .replace(/<lyric\b[\s\S]*?<\/lyric>/gi,'')
+  .replace(/<credit\b[\s\S]*?<\/credit>/gi,'')
+  .replace(/<words\b[^>]*>[\s\S]*?<\/words>/gi,'');
+}
 app.post('/api/visual-transcribe',upload.array('visualScores',20),async(req,res)=>{const fileIds=[];try{
  const files=Array.isArray(req.files)?req.files:[];
  if(!files.length)throw Error('Choose at least one PDF or score image first.');
@@ -605,6 +631,7 @@ app.post('/api/visual-transcribe',upload.array('visualScores',20),async(req,res)
   xml=extractMusicXML(responseOutputText(vj)); verificationUsage=vj?.usage||null;
  }
 
+ if(musicOnly)xml=sanitizeMusicOnlyXML(xml);
  const parsed=parseXML(Buffer.from(xml));
  const noteCount=parsed.parts.reduce((n,p)=>n+p.events.filter(e=>!e.isRest).length,0);
  const eventCount=parsed.parts.reduce((n,p)=>n+p.events.length,0);
