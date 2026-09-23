@@ -1,7 +1,8 @@
 import express from 'express';
 import multer from 'multer';
 import { XMLParser } from 'fast-xml-parser';
-import { Midi } from '@tonejs/midi';
+import midiPkg from '@tonejs/midi';
+const { Midi } = midiPkg;
 import PDFDocument from 'pdfkit';
 
 const app=express(); const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
