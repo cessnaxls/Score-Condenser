@@ -4,6 +4,7 @@ import { XMLParser } from 'fast-xml-parser';
 import midiPkg from '@tonejs/midi';
 const { Midi } = midiPkg;
 import PDFDocument from 'pdfkit';
+import JSZip from 'jszip';
 
 const app=express(); const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
 app.use(express.json({limit:'5mb'})); app.use(express.static('public'));
@@ -28,7 +29,33 @@ function parseXML(buf){
  return {kind:'musicxml',parts};
 }
 function parseMidi(buf){ const m=new Midi(buf); return {kind:'midi',parts:m.tracks.map((t,i)=>({id:String(i),name:t.name||`Track ${i+1}`,voices:[`ch ${t.channel+1}`],events:t.notes.map(n=>({voice:`ch ${t.channel+1}`,midi:n.midi,start:n.ticks/m.header.ppq,dur:n.durationTicks/m.header.ppq}))}))}; }
-app.post('/api/import',upload.single('score'),(req,res)=>{try{const n=req.file.originalname.toLowerCase(); res.json(n.endsWith('.mid')||n.endsWith('.midi')?parseMidi(req.file.buffer):parseXML(req.file.buffer));}catch(e){res.status(400).json({error:e.message})}});
+async function parseMXL(buf){
+ const zip=await JSZip.loadAsync(buf);
+ let rootPath='';
+ const containerEntry=zip.file('META-INF/container.xml');
+ if(containerEntry){
+  const containerXML=await containerEntry.async('string');
+  const c=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_'}).parse(containerXML);
+  const rootfiles=arr(c?.container?.rootfiles?.rootfile);
+  rootPath=rootfiles.find(r=>String(r?.['@_media-type']||'').includes('musicxml'))?.['@_full-path'] || rootfiles[0]?.['@_full-path'] || '';
+ }
+ if(!rootPath){
+  rootPath=Object.keys(zip.files).find(n=>!zip.files[n].dir && /\.(musicxml|xml)$/i.test(n) && !/^META-INF\//i.test(n)) || '';
+ }
+ if(!rootPath || !zip.file(rootPath)) throw Error('This .mxl archive does not contain a readable MusicXML score.');
+ const xml=await zip.file(rootPath).async('nodebuffer');
+ return parseXML(xml);
+}
+app.post('/api/import',upload.single('score'),async(req,res)=>{try{
+ if(!req.file) throw Error('Choose a score file first.');
+ const n=req.file.originalname.toLowerCase();
+ let parsed;
+ if(n.endsWith('.mid')||n.endsWith('.midi')) parsed=parseMidi(req.file.buffer);
+ else if(n.endsWith('.mxl')) parsed=await parseMXL(req.file.buffer);
+ else if(n.endsWith('.musicxml')||n.endsWith('.xml')) parsed=parseXML(req.file.buffer);
+ else throw Error('Unsupported file type. Use .mxl, .musicxml, .xml, .mid, or .midi.');
+ res.json(parsed);
+}catch(e){res.status(400).json({error:e.message})}});
 function noteName(m){const pc=['C','C♯','D','E♭','E','F','F♯','G','A♭','A','B♭','B'][m%12];return pc+(Math.floor(m/12)-1)}
 function buildCondensed(parts,selected){const ev=[]; for(const p of parts) for(const e of p.events) if(selected.includes(`${p.id}|${e.voice}`)) ev.push({...e,part:p.name}); ev.sort((a,b)=>a.start-b.start||b.midi-a.midi); return ev;}
 app.post('/api/pdf',(req,res)=>{try{const {parts,selected,meta={}}=req.body; const ev=buildCondensed(parts,selected); const doc=new PDFDocument({size:'LETTER',margins:{top:54,bottom:54,left:54,right:54}}); const chunks=[]; doc.on('data',c=>chunks.push(c)); doc.on('end',()=>{res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition','attachment; filename="condensed-score.pdf"');res.end(Buffer.concat(chunks));});

@@ -1,6 +1,6 @@
 {
   "name": "score-condensor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,7 +11,8 @@
     "multer": "^1.4.5-lts.1",
     "@tonejs/midi": "^2.0.28",
     "fast-xml-parser": "^4.5.3",
-    "pdfkit": "^0.16.0"
+    "pdfkit": "^0.16.0",
+    "jszip": "^3.10.1"
   },
   "engines": {
     "node": ">=22 <23"
