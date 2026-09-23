@@ -19,7 +19,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 function parseXML(buf){
  const x=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_',parseTagValue:false,preserveOrder:false}).parse(buf.toString());
  const score=x['score-partwise']; if(!score) throw Error('This app expects a MusicXML score-partwise document.');
- const names={}; for(const p of arr(score['part-list']?.['score-part'])) names[p['@_id']]=String(p['part-name']||p['@_id']);
+ const names={}; for(const p of arr(score['part-list']?.['score-part'])) { const pn=p['part-name']; names[p['@_id']]=typeof pn==='object'?String(pn?.['#text']||pn?.['display-text']||p['@_id']):String(pn||p['@_id']); }
  const credits=arr(score.credit).flatMap(c=>arr(c?.['credit-words']).map(w=>typeof w==='object'?String(w['#text']||''):String(w))).map(v=>v.trim()).filter(Boolean);
  const creators=arr(score.identification?.creator);
  const composerNode=creators.find(c=>typeof c==='object'&&String(c['@_type']||'').toLowerCase()==='composer')||creators[0];
@@ -43,14 +43,20 @@ function parseXML(buf){
    measureMeta[mi]={beats,beatType,fifths,nominalQ};
    let cursor=0,lastStart=0;
    for(const n of arr(m.note)){
-    const durDiv=Number(n.duration||0),dur=durDiv/divisions,v=String(n.voice||'1'); voices.add(v);
+    const durDiv=Number(n.duration||0),rawDur=durDiv/divisions,v=String(n.voice||'1'); voices.add(v);
+    const measureRest=n.rest!==undefined && typeof n.rest==='object'&&String(n.rest?.['@_measure']||'')==='yes';
+    // Some OMR/legacy MusicXML files encode a compressed multi-measure rest as one
+    // measure=yes rest whose duration spans many bars. For keyboard reduction that
+    // must occupy only this MusicXML measure; otherwise later validation sees starts
+    // such as 32–36 beats inside a 4/4 bar.
+    const dur=measureRest && rawDur>nominalQ+.0001 ? nominalQ : rawDur;
     const start=n.chord!==undefined?lastStart:cursor; if(n.chord===undefined)lastStart=start;
     if(n.pitch){
       const step=String(n.pitch.step),alt=Number(n.pitch.alter||0),oct=Number(n.pitch.octave),midi=(oct+1)*12+stepSemi[step]+alt;
       const beams=arr(n.beam).map(b=>typeof b==='object'?{number:Number(b['@_number']||1),value:String(b['#text']||'')}:{number:1,value:String(b)}).filter(b=>b.value);
       events.push({voice:v,midi,step,alter:alt,octave:oct,measure:mi,start,dur:Math.max(dur,.0625),type:String(n.type||''),dot:n.dot!==undefined,beams,sourceStaff:Number(n.staff||0)||0,isRest:false});
     } else if(n.rest!==undefined && dur>0){
-      events.push({voice:v,isRest:true,measure:mi,start,dur,type:String(n.type||''),dot:n.dot!==undefined,sourceStaff:Number(n.staff||0)||0,measureRest:typeof n.rest==='object'&&String(n.rest?.['@_measure']||'')==='yes'});
+      events.push({voice:v,isRest:true,measure:mi,start,dur,type:String(n.type||''),dot:n.dot!==undefined,sourceStaff:Number(n.staff||0)||0,measureRest});
     }
     if(n.chord===undefined)cursor+=dur;
    }
@@ -223,7 +229,10 @@ function sourceMeasureEnd(streams,m){
 function measureTiming(first,streams,m,maxM){
  const mm=first?.meta?.measureMeta?.[m]||{},beats=Number(mm.beats||first?.meta?.beats||4),beatType=Number(mm.beatType||first?.meta?.beatType||4),nominalQ=beats*(4/beatType),sourceEnd=sourceMeasureEnd(streams,m);
  const shortEdge=(m===0||m===maxM)&&sourceEnd>.0001&&sourceEnd<nominalQ-.0001;
- return {beats,beatType,nominalQ,targetQ:shortEdge?sourceEnd:nominalQ};
+ // Imported/OMR MusicXML is occasionally overfull or uses non-barred phrase measures.
+ // Preserve that material instead of crashing. The source span becomes authoritative
+ // for this measure, while normal well-formed bars still use the notated meter.
+ return {beats,beatType,nominalQ,targetQ:shortEdge?sourceEnd:Math.max(nominalQ,sourceEnd),irregular:sourceEnd>nominalQ+.0001};
 }
 function assertEventFits(e,targetQ,m,label){const start=Number(e.start||0),end=start+Number(e.dur||0);if(start<-.0001||end>targetQ+.0001)throw Error(`Rhythmic validation failed in measure ${m+1}, ${label}: event ${start.toFixed(3)}–${end.toFixed(3)} exceeds ${targetQ.toFixed(3)} beats.`);}
 function padForward(cursor,targetQ,div,voiceNo,staff){return cursor<targetQ-.0001?forwardXML(targetQ-cursor,div,voiceNo,staff):'';}
@@ -232,7 +241,7 @@ function makeLiteralReduction(parts,selected,meta={}){
  const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
  let measures='';
  for(let m=0;m<=maxM;m++){
-  const timing=editionMeasureTiming(first,streams,m,maxM,intelligence),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
+  const timing=measureTiming(first,streams,m,maxM),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
   let body='';
   for(let si=0;si<streams.length;si++){
    const stream=streams[si],voiceNo=stream.voiceNo,defaultStaff=inferredStreamStaff(stream);
@@ -284,17 +293,30 @@ function pitchFieldsFromMidi(midi){
  const steps=['C','C','D','D','E','F','F','G','G','A','A','B'],alts=[0,1,0,1,0,0,1,0,1,0,1,0];
  return {midi:Number(midi),step:steps[pc],alter:alts[pc],octave:oct};
 }
-function transformStreamsForEdition(streams,intelligence={}){
+function sourceMeter(first,m){
+ const mm=first?.meta?.measureMeta?.[m]||{};
+ const beats=Number(mm.beats||first?.meta?.beats||4),beatType=Number(mm.beatType||first?.meta?.beatType||4);
+ return {beats,beatType,nominalQ:beats*(4/beatType)};
+}
+function earlyAugmentationForMeasure(first,m,mode){
+ const src=sourceMeter(first,m),eps=.0001;
+ if(mode==='off'||!mode)return {...src,augment:false,targetBeats:src.beats,targetBeatType:src.beatType,targetQ:src.nominalQ};
+ // The operation means augmentation, not merely relabelling the meter:
+ // source spans equivalent to 2/4 become 2/2 and 3/4 become 3/2 while every
+ // note/rest and onset doubles. "auto" handles mixed 2/4 + 3/4 sources.
+ if(Math.abs(src.nominalQ-2)<eps && (mode==='auto'||mode==='2/2'))return {...src,augment:true,targetBeats:2,targetBeatType:2,targetQ:4};
+ if(Math.abs(src.nominalQ-3)<eps && (mode==='auto'||mode==='3/2'))return {...src,augment:true,targetBeats:3,targetBeatType:2,targetQ:6};
+ return {...src,augment:false,targetBeats:src.beats,targetBeatType:src.beatType,targetQ:src.nominalQ};
+}
+function transformStreamsForEdition(streams,intelligence={},first){
  const semitones=Math.max(-24,Math.min(24,Number(intelligence.transposeSemitones||0)||0));
  const earlyMode=String(intelligence.earlyMusicMode||'off');
- const augment=earlyMode==='2/2'||earlyMode==='3/2';
  return streams.map(st=>({...st,events:st.events.map(e=>{
    let out={...e};
-   if(augment){
+   const em=earlyAugmentationForMeasure(first,Number(out.measure||0),earlyMode);
+   if(em.augment){
      out.start=Number(out.start||0)*2;
      out.dur=Number(out.dur||0)*2;
-     // The rhythmic value has changed, so do not preserve stale source type/beam tags.
-     // Dots remain valid: dotted quarter -> dotted half, dotted whole -> dotted breve, etc.
      out.type='';out.beams=[];
    }
    if(!out.isRest && semitones){out={...out,...pitchFieldsFromMidi(Number(out.midi)+semitones)};}
@@ -302,12 +324,14 @@ function transformStreamsForEdition(streams,intelligence={}){
  })}));
 }
 function editionMeasureTiming(first,streams,m,maxM,intelligence={}){
- const mode=String(intelligence.earlyMusicMode||'off');
- if(mode!=='2/2'&&mode!=='3/2')return measureTiming(first,streams,m,maxM);
- const beats=mode==='2/2'?2:3,beatType=2,nominalQ=beats*2,sourceEnd=sourceMeasureEnd(streams,m);
- if(sourceEnd>nominalQ+.0001)throw Error(`Early-music ${mode} augmentation does not fit measure ${m+1}. Use 2/2 for source measures equivalent to 2/4, or 3/2 for source measures equivalent to 3/4.`);
+ const mode=String(intelligence.earlyMusicMode||'off'),em=earlyAugmentationForMeasure(first,m,mode);
+ if(!em.augment)return measureTiming(first,streams,m,maxM);
+ const sourceEnd=sourceMeasureEnd(streams,m),nominalQ=em.targetQ;
  const shortEdge=(m===0||m===maxM)&&sourceEnd>.0001&&sourceEnd<nominalQ-.0001;
- return {beats,beatType,nominalQ,targetQ:shortEdge?sourceEnd:nominalQ};
+ // Never reject a whole score because one imported measure is irregular. For an eligible
+ // 2/4→2/2 or 3/4→3/2 bar, normal output is exactly 4Q or 6Q; overfull OMR/source bars
+ // retain their full span and are marked irregular internally rather than truncated.
+ return {beats:em.targetBeats,beatType:em.targetBeatType,nominalQ,targetQ:shortEdge?sourceEnd:Math.max(nominalQ,sourceEnd),irregular:sourceEnd>nominalQ+.0001,augmented:true};
 }
 
 function intelligentOctaveNormalize(e,staff,range){
@@ -354,9 +378,10 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
  // Canonical rule: literal import owns rhythm. Intelligent mode may only change engraving
  // ownership (staff/voice/stem/chord). Pitch, onset and duration are immutable.
  const sourceStreams=selectedStreams(parts,selected);if(!sourceStreams.length)throw Error('Select at least one voice.');
- const streams=transformStreamsForEdition(sourceStreams,intelligence);
+ const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0];
+ const streams=transformStreamsForEdition(sourceStreams,intelligence,first);
  const canonical=canonicalNoteSignature(streams);
- const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
+ const fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
  let measures='', emittedSignature=[];
  for(let m=0;m<=maxM;m++){
   const timing=editionMeasureTiming(first,streams,m,maxM,intelligence),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
