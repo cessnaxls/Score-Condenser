@@ -619,90 +619,110 @@ function pruneOmrJobs(){
  for(const [id,j] of omrJobs)if(j.createdAt<cutoff)omrJobs.delete(id);
 }
 function omrJobId(){return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,10)}`;}
+function parseJsonOutput(text=''){
+ const cleaned=String(text).replace(/^```(?:json)?\s*/i,'').replace(/```\s*$/,'').trim();
+ try{return JSON.parse(cleaned);}catch{}
+ const a=cleaned.indexOf('{'),b=cleaned.lastIndexOf('}');
+ if(a>=0&&b>a){try{return JSON.parse(cleaned.slice(a,b+1));}catch{}}
+ throw Error('OMR returned invalid notation JSON. No retry was made, so no additional model call was charged.');
+}
+function inferExpectedStaffCount(files=[]){
+ const counts=[];
+ for(const f of files){const m=String(f.originalname||'').match(/-staves-(\d+)\./i);if(m)counts.push(Number(m[1]));}
+ if(!counts.length)return 0;
+ const freq=new Map();for(const n of counts)freq.set(n,(freq.get(n)||0)+1);
+ return [...freq.entries()].sort((a,b)=>b[1]-a[1]||a[0]-b[0])[0][0];
+}
+const typeTicks={maxima:768,long:384,breve:192,whole:96,half:48,quarter:24,eighth:12,'16th':6,'32nd':3,'64th':1.5,unknown:0};
+function ticksToType(t){
+ const choices=[['maxima',768],['long',384],['breve',192],['whole',96],['half',48],['quarter',24],['eighth',12],['16th',6],['32nd',3]];
+ let best='quarter',d=Infinity;for(const [n,v] of choices){const x=Math.abs(t-v);if(x<d){d=x;best=n;}}return best;
+}
+function pitchXml(step,alter,octave){return `<pitch><step>${step}</step>${alter?`<alter>${alter}</alter>`:''}<octave>${octave}</octave></pitch>`;}
+function clefXml(c){const sign=['G','F','C'].includes(String(c?.sign||'').toUpperCase())?String(c.sign).toUpperCase():'G';const line=Math.max(1,Math.min(5,Number(c?.line)|| (sign==='F'?4:sign==='C'?3:2)));const oc=Number(c?.octave_change||0);return `<clef>${oc?`<clef-octave-change>${oc}</clef-octave-change>`:''}<sign>${sign}</sign><line>${line}</line></clef>`;}
+function buildMusicXMLFromOmrJson(data,{musicOnly=true,expectedStaffCount=0}={}){
+ const T=24; // local deterministic grid: 24 ticks per quarter, exact for triplets and common subdivisions
+ const warnings=[];
+ const rawMeasures=arr(data?.measures).map((m,i)=>({number:Number(m?.number)||i+1,beats:Math.max(1,Number(m?.beats)||4),beatType:Math.max(1,Number(m?.beat_type)||4),fifths:Math.max(-7,Math.min(7,Number(m?.fifths)||0))}));
+ const maxMeasure=Math.max(1,...arr(data?.events).map(e=>Number(e?.measure)||0),...rawMeasures.map(m=>m.number));
+ const measureMap=new Map(rawMeasures.map(m=>[m.number,m]));let last={beats:4,beatType:4,fifths:0};
+ const measures=[];for(let n=1;n<=maxMeasure;n++){const m=measureMap.get(n);if(m)last={...last,...m};measures.push({number:n,...last});}
+ let staffCount=Math.max(1,Number(data?.staff_count)||0,...arr(data?.events).map(e=>Number(e?.staff)||0),...arr(data?.clefs).map(c=>Number(c?.staff)||0));
+ if(expectedStaffCount){
+  if(staffCount!==expectedStaffCount)warnings.push(`OMR staff-count warning: expected ${expectedStaffCount} staves from the detected systems but the model returned ${staffCount}.`);
+  staffCount=expectedStaffCount;
+ }
+ const staffNames=arr(data?.staff_names).map(x=>String(x||'').trim());
+ const clefs=arr(data?.clefs).filter(c=>Number(c?.staff)>=1&&Number(c?.staff)<=staffCount);
+ const events=[];const seen=new Set();let dropped=0;
+ for(const r of arr(data?.events)){
+  const kind=String(r?.kind||'').toLowerCase();if(kind!=='note'&&kind!=='rest'){dropped++;continue;}
+  const measure=Number(r?.measure),staff=Number(r?.staff),voice=Math.max(1,Number(r?.voice)||1),onset=Math.round(Number(r?.onset_ticks)),duration=Math.round(Number(r?.duration_ticks));
+  if(!Number.isInteger(measure)||measure<1||measure>maxMeasure||!Number.isInteger(staff)||staff<1||staff>staffCount||!Number.isFinite(onset)||onset<0||!Number.isFinite(duration)||duration<=0){dropped++;continue;}
+  const mm=measures[measure-1],limit=Math.round(mm.beats*(4/mm.beatType)*T);
+  if(onset+duration>limit){dropped++;warnings.push(`Dropped an event outside measure ${measure} (staff ${staff}, ${onset}–${onset+duration} of ${limit} ticks).`);continue;}
+  let step=String(r?.step||'').toUpperCase(),alter=Math.max(-2,Math.min(2,Number(r?.alter)||0)),octave=Number(r?.octave);
+  if(kind==='note'&&(!/^[A-G]$/.test(step)||!Number.isInteger(octave)||octave<0||octave>9)){dropped++;continue;}
+  const key=[kind,measure,staff,voice,onset,duration,step,alter,octave].join('|');if(seen.has(key))continue;seen.add(key);
+  events.push({kind,measure,staff,voice,onset,duration,step,alter,octave,type:String(r?.type||'unknown'),dots:Math.max(0,Math.min(3,Number(r?.dots)||0)),tieStart:!!r?.tie_start,tieStop:!!r?.tie_stop,beam:String(r?.beam||'none'),confidence:Number(r?.confidence)});
+ }
+ if(dropped)warnings.push(`OMR validator discarded ${dropped} malformed/out-of-measure event${dropped===1?'':'s'} instead of engraving them.`);
+ const noteCount=events.filter(e=>e.kind==='note').length;
+ if(maxMeasure>=8&&noteCount<maxMeasure*2)throw Error(`OMR result failed completeness validation (${noteCount} notes across ${maxMeasure} measures). Nothing was auto-retried, so no second Terra call was made.`);
+ const denseBad=[];for(let m=1;m<=maxMeasure;m++)for(let st=1;st<=staffCount;st++){
+  const ev=events.filter(e=>e.measure===m&&e.staff===st&&e.kind==='note');
+  const by=new Map();for(const e of ev){const k=e.onset;by.set(k,(by.get(k)||0)+1);}if([...by.values()].some(n=>n>12))denseBad.push(`${m}/${st}`);
+ }
+ if(denseBad.length)throw Error(`OMR result failed collision validation in measure/staff ${denseBad.slice(0,6).join(', ')}. No second Terra call was made.`);
+ const title=musicOnly?'':String(data?.metadata?.title||'');
+ const composer=musicOnly?'':String(data?.metadata?.composer||'');
+ const partList=[];const parts=[];
+ for(let st=1;st<=staffCount;st++){
+  const id=`P${st}`,name=staffNames[st-1]||`Staff ${st}`;partList.push(`<score-part id="${id}"><part-name>${esc(name)}</part-name></score-part>`);
+  let prevAttr='';const ms=[];
+  for(const mm of measures){
+   const attrKey=`${mm.beats}/${mm.beatType}/${mm.fifths}`;let attr='';
+   if(mm.number===1||attrKey!==prevAttr){
+    const c=clefs.filter(x=>Number(x.measure||1)<=mm.number&&Number(x.staff)===st).sort((a,b)=>Number(b.measure||1)-Number(a.measure||1))[0]||{sign:st===staffCount&&staffCount===2?'F':'G',line:st===staffCount&&staffCount===2?4:2};
+    attr=`<attributes><divisions>${T}</divisions><key><fifths>${mm.fifths}</fifths></key><time><beats>${mm.beats}</beats><beat-type>${mm.beatType}</beat-type></time>${clefXml(c)}</attributes>`;prevAttr=attrKey;
+   }
+   const ev=events.filter(e=>e.measure===mm.number&&e.staff===st).sort((a,b)=>a.voice-b.voice||a.onset-b.onset||b.duration-a.duration);
+   const voices=[...new Set(ev.map(e=>e.voice))].sort((a,b)=>a-b);let body=attr;
+   for(let vi=0;vi<voices.length;vi++){
+    const v=voices[vi];if(vi>0){const span=Math.round(mm.beats*(4/mm.beatType)*T);body+=`<backup><duration>${span}</duration></backup>`;}
+    let cursor=0;const ve=ev.filter(e=>e.voice===v);
+    for(const e of ve){if(e.onset>cursor)body+=`<forward><duration>${e.onset-cursor}</duration></forward>`;else if(e.onset<cursor)body+=`<backup><duration>${cursor-e.onset}</duration></backup>`;
+     const typ=e.type&&e.type!=='unknown'?e.type:ticksToType(e.duration);const dots='<dot/>'.repeat(e.dots);const tie=(e.tieStart?'<tie type="start"/>':'')+(e.tieStop?'<tie type="stop"/>':'');const not=(e.tieStart||e.tieStop)?`<notations>${e.tieStop?'<tied type="stop"/>':''}${e.tieStart?'<tied type="start"/>':''}</notations>`:'';const beam=['begin','continue','end'].includes(e.beam)?`<beam number="1">${e.beam}</beam>`:'';
+     body+=`<note>${e.kind==='rest'?'<rest/>':pitchXml(e.step,e.alter,e.octave)}<duration>${e.duration}</duration>${tie}<voice>${v}</voice><type>${typ}</type>${dots}${beam}${not}</note>`;cursor=e.onset+e.duration;}
+   }
+   ms.push(`<measure number="${mm.number}">${body}</measure>`);
+  }
+  parts.push(`<part id="${id}">${ms.join('')}</part>`);
+ }
+ const xml=`<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0">${title?`<work><work-title>${esc(title)}</work-title></work>`:''}${composer?`<identification><creator type="composer">${esc(composer)}</creator></identification>`:''}<part-list>${partList.join('')}</part-list>${parts.join('')}</score-partwise>`;
+ return {xml,warnings,noteCount,eventCount:events.length,measureCount:maxMeasure,staffCount};
+}
 async function runVisualTranscription(jobReq){
  const fileIds=[];
  try{
- const files=Array.isArray(jobReq.files)?jobReq.files:[];
- if(!files.length)throw Error('Choose at least one PDF or score image first.');
- const apiKey=process.env.OPENAI_API_KEY;
- if(!apiKey)throw Error('Visual transcription needs OPENAI_API_KEY configured in Render.');
- const requestedModel=String(jobReq.body?.model||'');
- const model=['gpt-5.6-luna','gpt-5.6-terra'].includes(requestedModel)?requestedModel:(process.env.OMR_MODEL||'gpt-5.6-terra');
- const profile=String(jobReq.body?.profile||'historical')==='modern'?'modern':'historical';
- const musicOnly=String(jobReq.body?.musicOnly||'1')!=='0';
- const verify=String(jobReq.body?.verify||'0')!=='0';
- const segmented=String(jobReq.body?.segmented||'0')==='1';
-
- const sourceContent=[];
- for(const f of files){
-  const mime=(f.mimetype||(/\.pdf$/i.test(f.originalname)?'application/pdf':'image/png')).toLowerCase();
-  if(mime.startsWith('image/')){
-   // Responses accepts images as input_image content, not as context-stuffing files.
-   // Sending PNG/JPEG through /v1/files with purpose=user_data triggers the
-   // "Expected context stuffing file type ... but got .png" error.
-   const b64=f.buffer.toString('base64');
-   sourceContent.push({type:'input_image',image_url:`data:${mime};base64,${b64}`,detail:'high'});
-   continue;
-  }
-  const fd=new FormData();fd.append('purpose','user_data');fd.append('file',new Blob([f.buffer],{type:mime}),f.originalname||'score-page.pdf');
-  const fr=await fetch('https://api.openai.com/v1/files',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`},body:fd});
-  const fj=await fr.json();if(!fr.ok)throw Error(fj?.error?.message||`Could not upload ${f.originalname||'score file'} for visual transcription.`);
-  fileIds.push(fj.id);
-  sourceContent.push({type:'input_file',file_id:fj.id});
- }
- const profileRules=profile==='historical'?`HISTORICAL / EARLY-MUSIC PROFILE:\n- Expect scans, uneven print, old fonts, unusual spacing, C/F/G clefs, breves, long values, proportional signs, repeat signs, old-looking rests and dense chordal writing.\n- Do not mistake hollow noteheads, breve noteheads, mensuration-like signs, clefs, accidentals or old rest shapes for text or printing noise.\n- Encode written values literally. Use <type>breve</type> for breves; use <type>long</type> or <type>maxima</type> when clearly present. Preserve dots and ties.\n- If the notation is modernized early music, still preserve the printed rhythm exactly rather than normalizing it.`:`MODERN ENGRAVING PROFILE:\n- Treat the source as conventional modern staff notation while preserving all written pitches, rhythms, clefs, rests, ties, repeats and voices.`;
- const textRule=musicOnly?`MUSIC-ONLY RULE (MANDATORY): exclude ALL lyrics, underlay, titles, prose, poetry, verse blocks, movement labels, page numbers, captions, editorial footnotes and other non-musical text. Do not put them into <lyric>, <credit>, <words>, <direction>, part names, or metadata. Only musical notation and neutral generated part names such as Part 1 / Staff 1 may appear.`:`Text may be retained only when it is structurally necessary to the music.`;
- const fileOrder=files.map((f,i)=>`${i+1}. ${f.originalname||`image ${i+1}`}`).join('\n');
- const segmentationRule=segmented?`\nSYSTEM-CROP INPUT:\n- The attachments have already been cropped to individual printed music systems by the browser, in page/top-to-bottom order. Treat each crop as a complete system region, not as a whole page.\n- Do not invent material between crops. Preserve continuity across successive crops.\n- Use the repeated staff order in each system to maintain stable source parts (top staff stays the top source part, etc.).\n- Because prose/lyrics outside the staff systems have been removed, concentrate on exact staff positions, barlines, accidentals and durations.`:'';
- const prompt=`You are a literal optical music recognition engine. Convert ALL attached printed music files into ONE continuous valid MusicXML 4.0 score-partwise document. Return ONLY XML, no Markdown. The attachments are consecutive source pages/images in this exact order:\n${fileOrder}\n\n${textRule}\n\n${profileRules}${segmentationRule}\n\nACCURACY RULES — THESE OVERRIDE GUESSING:\n1. First locate every music system and every staff. Ignore all pixels outside music systems when Music-only mode is active.\n2. Read EACH STAFF independently before combining anything. Never infer harmony from neighboring staves. A note pitch must come from its vertical staff position plus the active clef/key/accidental context.\n3. For every measure, explicitly account for every printed notehead/rest and its duration. Chords require vertically aligned noteheads at the same onset. Do not create isolated notes, ornaments, accidentals, rests, or chords unless they are visibly present.\n4. Preserve each source staff/part separately and track the same staff across systems/pages. DO NOT collapse a multi-staff source into a keyboard reduction.\n5. Detect barlines and measures first, then transcribe measure-by-measure. Preserve every visible pitch, accidental, clef, key signature, meter/mensuration-equivalent sign, rest, beam, tie, augmentation dot, pickup, repeat and ending.\n6. Use separate <voice> values for simultaneous independent rhythms. Use correct MusicXML <backup>/<forward> so each voice has its literal measure-relative onset.\n7. Full-measure rests occupy exactly one measure. Never use one rest to span several measures.\n8. When uncertain about a symbol, do NOT invent a plausible note. Prefer an explicit rest only if a rest is actually visible; otherwise keep the surrounding measure structure conservative.\n9. Output literal SOURCE TRANSCRIPTION only. Do not transpose, octave-fold, condense, harmonize, simplify or keyboard-arrange it.\n10. Multiple uploaded images are consecutive pages/regions of the SAME score unless the notation itself clearly proves otherwise. Preserve continuity between them.\n\nSELF-CHECK BEFORE ANSWERING:\n- Re-scan each system from left to right and compare the MusicXML measure-by-measure against the image.\n- Check every pitch against clef + staff position, especially ledger-line notes.\n- Check every accidental and chord note individually.\n- Check each voice's duration sum against the printed meter.\n- Dense source measures must not become empty; blank source measures must not gain invented notes.\n- Do not output any textual/lyric material when Music-only is on.`;
- sourceContent.push({type:'input_text',text:prompt});
- const rr=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},body:JSON.stringify({model,input:[{role:'user',content:sourceContent}],reasoning:{effort:'high'},max_output_tokens:96000})});
- const rj=await rr.json();if(!rr.ok)throw Error(rj?.error?.message||'Visual transcription failed.');
- let xml=extractMusicXML(responseOutputText(rj));
- validateOmrPartwise(xml); // Never spend a second model call trying to repair a structurally invalid first response.
- let verificationUsage=null,verificationWarning='';
-
- if(verify){
-  const audit=`Audit the draft MusicXML below against EVERY attached source image/PDF at symbol level, then return a COMPLETE corrected MusicXML 4.0 score-partwise document only. Do not explain changes.\n\nThis is a correction pass, not a creative transcription. Remove hallucinated/random notes. Correct every visibly mismatched pitch, octave, accidental, chord member, rest, onset and duration. Preserve source staff separation. Respect clefs and key signatures measure by measure. Check each measure from left to right against the pixels. Do not add lyrics or prose. Keep breves/long values literal. Ensure independent voices use <backup>/<forward> correctly. If the draft and source disagree, the SOURCE IMAGE wins.\n\nDRAFT MUSICXML:\n${xml}`;
-  // Reuse the same visual/file inputs for verification. Images stay as input_image
-  // data URLs; PDFs remain uploaded input_file references.
-  const verifyContent=sourceContent.filter(x=>x.type!=='input_text').map(x=>({...x}));
-  verifyContent.push({type:'input_text',text:audit});
-  const vr=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},body:JSON.stringify({model,input:[{role:'user',content:verifyContent}],reasoning:{effort:'high'},max_output_tokens:96000})});
-  const vj=await vr.json();if(!vr.ok)throw Error(vj?.error?.message||'OMR verification pass failed.');
-  verificationUsage=vj?.usage||null;
-  try{
-   const checked=extractMusicXML(responseOutputText(vj));
-   validateOmrPartwise(checked);
-   xml=checked;
-  }catch(verifyShapeError){
-   // The first pass was already structurally valid. Do not throw away a paid successful
-   // transcription merely because the optional verifier returned prose/timewise/broken XML.
-   verificationWarning=`Verification output was unusable (${verifyShapeError.message}); kept the valid first-pass transcription.`;
-  }
- }
-
- if(musicOnly)xml=sanitizeMusicOnlyXML(xml);
- validateOmrPartwise(xml);
- const parsed=parseXML(Buffer.from(xml));
- const noteCount=parsed.parts.reduce((n,p)=>n+p.events.filter(e=>!e.isRest).length,0);
- const eventCount=parsed.parts.reduce((n,p)=>n+p.events.length,0);
- const measureCount=parsed.measures||0;
- const warnings=[];
- if(verificationWarning)warnings.push(verificationWarning);
- if(noteCount<10)warnings.push('OMR completeness warning: extremely few notes were recognized.');
- if(measureCount>=8&&noteCount/measureCount<2)warnings.push('OMR completeness warning: the result is suspiciously sparse; inspect it before condensing.');
- let timingIssues=0;
- for(const p of parsed.parts)for(let m=0;m<(p.meta?.measures||0);m++){
-  const meta=p.meta?.measureMeta?.[m],q=Number(meta?.nominalQ||0);if(!q)continue;
-  for(const e of p.events.filter(e=>e.measure===m))if(Number(e.start||0)<-.0001||Number(e.start||0)+Number(e.dur||0)>q+.01)timingIssues++;
- }
- if(timingIssues)warnings.push(`OMR timing warning: ${timingIssues} event${timingIssues===1?'':'s'} fall outside their printed measure; inspect those measures.`);
- if(!parsed.parts.length)throw Error('OMR returned no musical parts.');
- return {score:parsed,musicxml:xml,model,profile,musicOnly,verified:verify,segmented,fileCount:files.length,noteCount,eventCount,measureCount,warnings,usage:{transcription:rj?.usage||null,verification:verificationUsage}};
- } finally {
-  for(const id of fileIds)if(id&&process.env.OPENAI_API_KEY)fetch(`https://api.openai.com/v1/files/${encodeURIComponent(id)}`,{method:'DELETE',headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`}}).catch(()=>{});
- }
+  const files=Array.isArray(jobReq.files)?jobReq.files:[];
+  if(!files.length)throw Error('Choose at least one PDF or score image first.');
+  const apiKey=process.env.OPENAI_API_KEY;if(!apiKey)throw Error('Visual transcription needs OPENAI_API_KEY configured in Render.');
+  const requestedModel=String(jobReq.body?.model||'');const model=['gpt-5.6-luna','gpt-5.6-terra'].includes(requestedModel)?requestedModel:(process.env.OMR_MODEL||'gpt-5.6-terra');
+  const profile=String(jobReq.body?.profile||'historical')==='modern'?'modern':'historical';const musicOnly=String(jobReq.body?.musicOnly||'1')!=='0';const segmented=String(jobReq.body?.segmented||'0')==='1';
+  const expectedStaffCount=inferExpectedStaffCount(files);
+  const sourceContent=[];
+  for(const f of files){const mime=(f.mimetype||(/\.pdf$/i.test(f.originalname)?'application/pdf':'image/png')).toLowerCase();if(mime.startsWith('image/')){sourceContent.push({type:'input_image',image_url:`data:${mime};base64,${f.buffer.toString('base64')}`,detail:'high'});continue;}const fd=new FormData();fd.append('purpose','user_data');fd.append('file',new Blob([f.buffer],{type:mime}),f.originalname||'score-page.pdf');const fr=await fetch('https://api.openai.com/v1/files',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`},body:fd});const fj=await fr.json();if(!fr.ok)throw Error(fj?.error?.message||`Could not upload ${f.originalname||'score file'} for visual transcription.`);fileIds.push(fj.id);sourceContent.push({type:'input_file',file_id:fj.id});}
+  const profileRules=profile==='historical'?`Historical/early-music mode: recognize breves, long values, proportional signs, old clefs/rests and uneven print literally. Do not modernize durations.`:`Modern engraving mode: preserve the printed notation literally.`;
+  const prompt=`You are an optical music recognition engine. Read every attached score image/PDF in order and return ONLY one JSON object, not MusicXML and not prose. The server will build MusicXML deterministically from your data.\n\n${profileRules}\n${musicOnly?'Ignore all lyrics, titles, prose, page numbers, captions and footnotes.':''}\n${segmented?'Each attachment is one already-cropped music system. Maintain the same top-to-bottom staff identity across successive crops.':''}\n${expectedStaffCount?`The local staff detector found ${expectedStaffCount} staves per normal system. Return exactly staff_count=${expectedStaffCount} unless the notation visibly changes staff count.`:''}\n\nGRID: use exactly 24 onset/duration ticks per quarter note. Thus whole=96, half=48, quarter=24, eighth=12, sixteenth=6, dotted quarter=36, breve=192; triplet eighths can be 8 ticks.\n\nReturn JSON with keys: metadata, staff_count, staff_names, clefs, measures, events. metadata has title/composer but leave both empty in music-only mode. clefs is an array of {measure,staff,sign,line,octave_change}. measures is an array of {number,beats,beat_type,fifths}. events is an array of {kind,measure,staff,voice,onset_ticks,duration_ticks,step,alter,octave,type,dots,tie_start,tie_stop,beam,confidence}. kind is note or rest. For rests set step=REST, alter=0, octave=0. type is maxima,long,breve,whole,half,quarter,eighth,16th,32nd,64th,unknown. beam is none,begin,continue,end.\n\nACCURACY RULES:\n- Read each staff independently; never infer harmony or fill missing notes from musical expectation.\n- Determine note pitch from its visible staff position under the active clef/key/accidental context.\n- Detect barlines first, then number measures continuously across crops/pages.\n- Every event must fit inside its measure. Never use one rest to span multiple measures.\n- Preserve independent voices with distinct voice numbers but do not invent voices.\n- Do not collapse multiple source staves into a keyboard reduction.\n- Do not invent a full-measure rest just because recognition is uncertain. If a measure is unreadable, omit uncertain symbols rather than fabricating them.\n- Chords are multiple note events with identical measure/staff/voice/onset_ticks/duration_ticks.\n- Use confidence 0..1 for each event.\n- Re-scan every crop left-to-right before answering and remove any event that is not visibly supported.`;
+  sourceContent.push({type:'input_text',text:prompt});
+  const rr=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},body:JSON.stringify({model,input:[{role:'user',content:sourceContent}],reasoning:{effort:'high'},text:{format:{type:'json_object'}},max_output_tokens:96000})});
+  const rj=await rr.json();if(!rr.ok)throw Error(rj?.error?.message||'Visual transcription failed.');
+  const json=parseJsonOutput(responseOutputText(rj));
+  const built=buildMusicXMLFromOmrJson(json,{musicOnly,expectedStaffCount});validateOmrPartwise(built.xml);
+  const parsed=parseXML(Buffer.from(built.xml));if(!parsed.parts.length)throw Error('OMR returned no musical parts.');
+  return {score:parsed,musicxml:built.xml,model,profile,musicOnly,verified:false,segmented,fileCount:files.length,noteCount:built.noteCount,eventCount:built.eventCount,measureCount:built.measureCount,warnings:[...built.warnings,'JSON-first OMR: MusicXML was assembled and validated locally; no automatic verification/retry call was made.'],usage:{transcription:rj?.usage||null,verification:null}};
+ } finally {for(const id of fileIds)if(id&&process.env.OPENAI_API_KEY)fetch(`https://api.openai.com/v1/files/${encodeURIComponent(id)}`,{method:'DELETE',headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`}}).catch(()=>{});}
 }
 app.post('/api/visual-transcribe/start',upload.array('visualScores',20),(req,res)=>{
  try{
