@@ -611,16 +611,25 @@ function sanitizeMusicOnlyXML(xml=''){
   .replace(/<credit\b[\s\S]*?<\/credit>/gi,'')
   .replace(/<words\b[^>]*>[\s\S]*?<\/words>/gi,'');
 }
-app.post('/api/visual-transcribe',upload.array('visualScores',20),async(req,res)=>{const fileIds=[];try{
- const files=Array.isArray(req.files)?req.files:[];
+
+const omrJobs=new Map();
+function pruneOmrJobs(){
+ const cutoff=Date.now()-30*60*1000;
+ for(const [id,j] of omrJobs)if(j.createdAt<cutoff)omrJobs.delete(id);
+}
+function omrJobId(){return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,10)}`;}
+async function runVisualTranscription(jobReq){
+ const fileIds=[];
+ try{
+ const files=Array.isArray(jobReq.files)?jobReq.files:[];
  if(!files.length)throw Error('Choose at least one PDF or score image first.');
  const apiKey=process.env.OPENAI_API_KEY;
  if(!apiKey)throw Error('Visual transcription needs OPENAI_API_KEY configured in Render.');
- const requestedModel=String(req.body?.model||'');
+ const requestedModel=String(jobReq.body?.model||'');
  const model=['gpt-5.6-luna','gpt-5.6-terra'].includes(requestedModel)?requestedModel:(process.env.OMR_MODEL||'gpt-5.6-terra');
- const profile=String(req.body?.profile||'historical')==='modern'?'modern':'historical';
- const musicOnly=String(req.body?.musicOnly||'1')!=='0';
- const verify=String(req.body?.verify||'1')!=='0';
+ const profile=String(jobReq.body?.profile||'historical')==='modern'?'modern':'historical';
+ const musicOnly=String(jobReq.body?.musicOnly||'1')!=='0';
+ const verify=String(jobReq.body?.verify||'1')!=='0';
 
  for(const f of files){
   const mime=f.mimetype||(/\.pdf$/i.test(f.originalname)?'application/pdf':'image/png');
@@ -676,10 +685,44 @@ app.post('/api/visual-transcribe',upload.array('visualScores',20),async(req,res)
  }
  if(timingIssues)warnings.push(`OMR timing warning: ${timingIssues} event${timingIssues===1?'':'s'} fall outside their printed measure; inspect those measures.`);
  if(!parsed.parts.length)throw Error('OMR returned no musical parts.');
- res.json({score:parsed,musicxml:xml,model,profile,musicOnly,verified:verify,fileCount:files.length,noteCount,eventCount,measureCount,warnings,usage:{transcription:rj?.usage||null,verification:verificationUsage}});
- }catch(e){console.error(e);res.status(400).json({error:e.message});}
- finally{for(const id of fileIds)if(id&&process.env.OPENAI_API_KEY)fetch(`https://api.openai.com/v1/files/${encodeURIComponent(id)}`,{method:'DELETE',headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`}}).catch(()=>{});}
+ return {score:parsed,musicxml:xml,model,profile,musicOnly,verified:verify,fileCount:files.length,noteCount,eventCount,measureCount,warnings,usage:{transcription:rj?.usage||null,verification:verificationUsage}};
+ } finally {
+  for(const id of fileIds)if(id&&process.env.OPENAI_API_KEY)fetch(`https://api.openai.com/v1/files/${encodeURIComponent(id)}`,{method:'DELETE',headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`}}).catch(()=>{});
+ }
+}
+app.post('/api/visual-transcribe/start',upload.array('visualScores',20),(req,res)=>{
+ try{
+  const files=(Array.isArray(req.files)?req.files:[]).map(f=>({buffer:Buffer.from(f.buffer),mimetype:f.mimetype,originalname:f.originalname}));
+  if(!files.length)throw Error('Choose at least one PDF or score image first.');
+  pruneOmrJobs();
+  const id=omrJobId();
+  const body={...(req.body||{})};
+  omrJobs.set(id,{status:'running',createdAt:Date.now(),message:'Uploading source pages…'});
+  res.status(202).json({jobId:id});
+  setImmediate(async()=>{
+   try{
+    const result=await runVisualTranscription({files,body});
+    omrJobs.set(id,{status:'done',createdAt:Date.now(),result});
+   }catch(e){
+    console.error('OMR job failed',e);
+    omrJobs.set(id,{status:'error',createdAt:Date.now(),error:e?.message||String(e)});
+   }
+  });
+ }catch(e){res.status(400).json({error:e.message});}
 });
+app.get('/api/visual-transcribe/status/:id',(req,res)=>{
+ pruneOmrJobs();
+ const j=omrJobs.get(req.params.id);
+ if(!j)return res.status(404).json({error:'OMR job was not found or expired.'});
+ res.json(j.status==='done'?{status:'done',...j.result}:j.status==='error'?{status:'error',error:j.error}:{status:'running',message:j.message||'Transcribing notation…'});
+});
+// Backward-compatible synchronous route. The UI uses the job route above so long Terra
+// requests are not held open through Render's proxy.
+app.post('/api/visual-transcribe',upload.array('visualScores',20),async(req,res)=>{
+ try{res.json(await runVisualTranscription({files:req.files,body:req.body||{}}));}
+ catch(e){console.error(e);res.status(400).json({error:e.message});}
+});
+
 
 let toolkitPromise;
 async function getToolkit(){if(!toolkitPromise)toolkitPromise=createVerovioModule().then(m=>new VerovioToolkit(m));return toolkitPromise;}
