@@ -6,6 +6,8 @@ const { Midi } = midiPkg;
 import JSZip from 'jszip';
 import createVerovioModule from 'verovio/wasm';
 import { VerovioToolkit } from 'verovio/esm';
+import PDFDocument from 'pdfkit';
+import SVGtoPDF from 'svg-to-pdfkit';
 
 const app=express();
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
@@ -85,15 +87,47 @@ function stemAssignments(streams,m){
  return map;
 }
 function generatedBeams(es,beats,beatType){
- const out=new Map(); const beatQ=4/beatType;
- // Preserve explicit source beams whenever present.
- es.forEach((e,i)=>{if(e.beams?.length)out.set(i,e.beams)});
+ // Rebuild beams after condensation. Source beams may be invalid once voices/staves change.
+ const out=new Map();
+ const compound=beatType===8 && beats>=6 && beats%3===0;
+ const groupQ=compound?1.5:(4/beatType);
+ const beamable=e=>Number(e.dur||0)<=0.5+1e-6;
+ const sameStaff=(a,b)=>(a.midi>=60)===(b.midi>=60);
  let i=0;
  while(i<es.length){
-   if(es[i].dur>.5||out.has(i)){i++;continue}
-   const boundary=Math.floor((es[i].start+1e-6)/beatQ)*beatQ+beatQ;let j=i+1;
-   while(j<es.length && es[j].dur<=.5 && !out.has(j) && es[j].start<boundary-1e-6 && Math.abs((es[j-1].start+es[j-1].dur)-es[j].start)<.001)j++;
-   if(j-i>=2){for(let k=i;k<j;k++)out.set(k,[{number:1,value:k===i?'begin':k===j-1?'end':'continue'}]);}
+   const e=es[i];
+   if(!beamable(e)){i++;continue}
+   const groupStart=Math.floor((Number(e.start||0)+1e-7)/groupQ)*groupQ;
+   const groupEnd=groupStart+groupQ;
+   let j=i+1;
+   while(j<es.length){
+     const prev=es[j-1],cur=es[j];
+     if(!beamable(cur)||!sameStaff(e,cur))break;
+     if(Number(cur.start||0)>=groupEnd-1e-7)break;
+     if(Math.abs((Number(prev.start||0)+Number(prev.dur||0))-Number(cur.start||0))>.001)break;
+     j++;
+   }
+   if(j-i>=2){
+     // Primary beam: eighth-note level.
+     for(let k=i;k<j;k++) out.set(k,[{number:1,value:k===i?'begin':k===j-1?'end':'continue'}]);
+     // Secondary/tertiary beams for shorter values, with hooks for isolated short notes.
+     for(let level=2;level<=3;level++){
+       const maxDur=0.5/(2**(level-1));
+       let k=i;
+       while(k<j){
+         if(Number(es[k].dur||0)>maxDur+1e-7){k++;continue}
+         let z=k+1;
+         while(z<j && Number(es[z].dur||0)<=maxDur+1e-7 && Math.abs((Number(es[z-1].start||0)+Number(es[z-1].dur||0))-Number(es[z].start||0))<.001)z++;
+         if(z-k>=2){
+           for(let q=k;q<z;q++) out.get(q).push({number:level,value:q===k?'begin':q===z-1?'end':'continue'});
+         }else{
+           const hook=(k===i)?'forward hook':'backward hook';
+           out.get(k).push({number:level,value:hook});
+         }
+         k=z;
+       }
+     }
+   }
    i=Math.max(j,i+1);
  }
  return out;
@@ -118,5 +152,9 @@ function makeReduction(parts,selected,meta={}){
 
 let toolkitPromise;
 async function getToolkit(){if(!toolkitPromise)toolkitPromise=createVerovioModule().then(m=>new VerovioToolkit(m));return toolkitPromise;}
-app.post('/api/engrave',async(req,res)=>{try{const {parts,selected,meta={},layout={}}=req.body;const xml=makeReduction(parts,selected,meta);const tk=await getToolkit();const landscape=layout.orientation==='landscape',base=layout.pageSize==='a4'?{w:2100,h:2970}:{w:2159,h:2794},w=landscape?base.h:base.w,h=landscape?base.w:base.h,scale=Number(layout.scale||42),spacing=Number(layout.noteSpacing||1),stretch=Number(layout.barStretch||1),staff=Number(layout.staffSpacing||12),system=Number(layout.systemSpacing||10),margin=Number(layout.margin||60);tk.setOptions({pageWidth:w,pageHeight:h,pageMarginTop:margin,pageMarginBottom:margin,pageMarginLeft:margin,pageMarginRight:margin,scale,breaks:'auto',header:'auto',footer:'none',font:'Leipzig',spacingLinear:.25*spacing*stretch,spacingNonLinear:.6*spacing,spacingStaff:staff,spacingSystem:system,justifyVertically:true,systemDivider:'none'});tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));res.json({pages,musicxml:xml,pageCount:pages.length});}catch(e){console.error(e);res.status(400).json({error:e.message})}});
+function engravingGeometry(layout={}){const landscape=layout.orientation==='landscape',base=layout.pageSize==='a4'?{w:2100,h:2970,pw:595.28,ph:841.89}:{w:2159,h:2794,pw:612,ph:792};return landscape?{w:base.h,h:base.w,pw:base.ph,ph:base.pw}:{w:base.w,h:base.h,pw:base.pw,ph:base.ph};}
+function engravingOptions(layout={}){const {w,h}=engravingGeometry(layout),scale=Number(layout.scale||42),spacing=Number(layout.noteSpacing||1),stretch=Number(layout.barStretch||1),staff=Number(layout.staffSpacing||12),system=Number(layout.systemSpacing||10),margin=Number(layout.margin||60);return{pageWidth:w,pageHeight:h,pageMarginTop:margin,pageMarginBottom:margin,pageMarginLeft:margin,pageMarginRight:margin,scale,breaks:'auto',header:'auto',footer:'none',font:'Leipzig',spacingLinear:.25*spacing*stretch,spacingNonLinear:.6*spacing,spacingStaff:staff,spacingSystem:system,justifyVertically:false,systemDivider:'none'};}
+async function renderScore(body){const {parts,selected,meta={},layout={}}=body;const xml=makeReduction(parts,selected,meta);const tk=await getToolkit();tk.setOptions(engravingOptions(layout));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));return{xml,pages,layout};}
+app.post('/api/engrave',async(req,res)=>{try{const r=await renderScore(req.body);res.json({pages:r.pages,musicxml:r.xml,pageCount:r.pages.length});}catch(e){console.error(e);res.status(400).json({error:e.message})}});
+app.post('/api/pdf',async(req,res)=>{try{const r=await renderScore(req.body),g=engravingGeometry(r.layout);res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition','attachment; filename="keyboard-reduction.pdf"');const doc=new PDFDocument({autoFirstPage:false,compress:true,info:{Title:String(req.body?.meta?.title||'Keyboard reduction'),Author:String(req.body?.meta?.composer||'')}});doc.pipe(res);for(const svg of r.pages){doc.addPage({size:[g.pw,g.ph],margin:0});SVGtoPDF(doc,svg,0,0,{width:g.pw,height:g.ph,preserveAspectRatio:'xMidYMid meet'});}doc.end();}catch(e){console.error(e);if(!res.headersSent)res.status(400).json({error:e.message});else res.end();}});
 app.listen(process.env.PORT||3000,()=>console.log('Score Condensor running with Verovio engraving'));
