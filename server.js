@@ -66,12 +66,12 @@ async function parseMXL(buf){const zip=await JSZip.loadAsync(buf);let rootPath='
 app.post('/api/import',upload.single('score'),async(req,res)=>{try{if(!req.file)throw Error('Choose a score file first.');const b=req.file.buffer,n=req.file.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise');let parsed;if(midi)parsed=parseMidi(b);else if(zip)parsed=await parseMXL(b);else if(xml)parsed=parseXML(b);else if(/\.midi?$/.test(n))parsed=parseMidi(b);else if(/\.(mxl|musicxml|xml)$/.test(n))parsed=parseXML(b);else throw Error('Unsupported score file.');res.json(parsed);}catch(e){res.status(400).json({error:e.message})}});
 
 function selectedStreams(parts,selected){const streams=[];let v=1,order=0;for(const p of parts)for(const voice of p.voices){const key=`${p.id}|${voice}`;if(selected.includes(key))streams.push({voiceNo:v++,order:order++,name:`${p.name} · ${voice}`,events:p.events.filter(e=>e.voice===voice)});}return streams;}
-function typeFor(q){if(q>=4)return 'whole';if(q>=2)return 'half';if(q>=1)return 'quarter';if(q>=.5)return 'eighth';if(q>=.25)return '16th';return '32nd';}
+function typeFor(q){if(q>=8)return 'breve';if(q>=4)return 'whole';if(q>=2)return 'half';if(q>=1)return 'quarter';if(q>=.5)return 'eighth';if(q>=.25)return '16th';return '32nd';}
 function beamXML(beams=[]){return beams.map(b=>`<beam number="${Number(b.number||1)}">${esc(b.value)}</beam>`).join('');}
 function noteXML(e,voiceNo,div,chord=false,stem='',beams=[]){const d=Math.max(1,Math.round(e.dur*div)),staff=e.engravingStaff|| (e.midi>=60?1:2),tieStart=!!e.tieStart,tieStop=!!e.tieStop,ties=`${tieStop?'<tie type=\"stop\"/>':''}${tieStart?'<tie type=\"start\"/>':''}`,notations=(tieStart||tieStop)?`<notations>${tieStop?'<tied type=\"stop\"/>':''}${tieStart?'<tied type=\"start\"/>':''}</notations>`:'';return `<note>${chord?'<chord/>':''}<pitch><step>${esc(e.step)}</step>${e.alter?`<alter>${e.alter}</alter>`:''}<octave>${e.octave}</octave></pitch><duration>${d}</duration>${ties}<voice>${voiceNo}</voice><type>${typeFor(e.dur)}</type>${e.dot?'<dot/>':''}${stem?`<stem>${stem}</stem>`:''}${beamXML(beams)}<staff>${staff}</staff>${notations}</note>`;}
 function restSpec(q){
  const vals=[
-  [4,'whole',0],[3,'half',1],[2,'half',0],[1.5,'quarter',1],[1,'quarter',0],
+  [12,'breve',1],[8,'breve',0],[6,'whole',1],[4,'whole',0],[3,'half',1],[2,'half',0],[1.5,'quarter',1],[1,'quarter',0],
   [.75,'eighth',1],[.5,'eighth',0],[.375,'16th',1],[.25,'16th',0],[.1875,'32nd',1],[.125,'32nd',0]
  ];
  return vals.find(([v])=>Math.abs(q-v)<.0001)||null;
@@ -232,7 +232,7 @@ function makeLiteralReduction(parts,selected,meta={}){
  const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
  let measures='';
  for(let m=0;m<=maxM;m++){
-  const timing=measureTiming(first,streams,m,maxM),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
+  const timing=editionMeasureTiming(first,streams,m,maxM,intelligence),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
   let body='';
   for(let si=0;si<streams.length;si++){
    const stream=streams[si],voiceNo=stream.voiceNo,defaultStaff=inferredStreamStaff(stream);
@@ -284,6 +284,32 @@ function pitchFieldsFromMidi(midi){
  const steps=['C','C','D','D','E','F','F','G','G','A','A','B'],alts=[0,1,0,1,0,0,1,0,1,0,1,0];
  return {midi:Number(midi),step:steps[pc],alter:alts[pc],octave:oct};
 }
+function transformStreamsForEdition(streams,intelligence={}){
+ const semitones=Math.max(-24,Math.min(24,Number(intelligence.transposeSemitones||0)||0));
+ const earlyMode=String(intelligence.earlyMusicMode||'off');
+ const augment=earlyMode==='2/2'||earlyMode==='3/2';
+ return streams.map(st=>({...st,events:st.events.map(e=>{
+   let out={...e};
+   if(augment){
+     out.start=Number(out.start||0)*2;
+     out.dur=Number(out.dur||0)*2;
+     // The rhythmic value has changed, so do not preserve stale source type/beam tags.
+     // Dots remain valid: dotted quarter -> dotted half, dotted whole -> dotted breve, etc.
+     out.type='';out.beams=[];
+   }
+   if(!out.isRest && semitones){out={...out,...pitchFieldsFromMidi(Number(out.midi)+semitones)};}
+   return out;
+ })}));
+}
+function editionMeasureTiming(first,streams,m,maxM,intelligence={}){
+ const mode=String(intelligence.earlyMusicMode||'off');
+ if(mode!=='2/2'&&mode!=='3/2')return measureTiming(first,streams,m,maxM);
+ const beats=mode==='2/2'?2:3,beatType=2,nominalQ=beats*2,sourceEnd=sourceMeasureEnd(streams,m);
+ if(sourceEnd>nominalQ+.0001)throw Error(`Early-music ${mode} augmentation does not fit measure ${m+1}. Use 2/2 for source measures equivalent to 2/4, or 3/2 for source measures equivalent to 3/4.`);
+ const shortEdge=(m===0||m===maxM)&&sourceEnd>.0001&&sourceEnd<nominalQ-.0001;
+ return {beats,beatType,nominalQ,targetQ:shortEdge?sourceEnd:nominalQ};
+}
+
 function intelligentOctaveNormalize(e,staff,range){
  // Intelligent-only pitch folding. Bass-staff candidates more than an octave above the
  // measure's lowest bass pitch move down one octave; treble-staff candidates more than
@@ -295,7 +321,7 @@ function intelligentOctaveNormalize(e,staff,range){
  else if(staff===1 && Number.isFinite(range.highTreble) && midi<range.highTreble-12){midi+=12;shifted=true;}
  if(shifted && ((Number.isFinite(range.highTreble)&&midi>range.highTreble)||(Number.isFinite(range.lowBass)&&midi<range.lowBass)))return null;
  if(!shifted)return {...e};
- return {...e,...pitchFieldsFromMidi(midi),intelligentOctaveShift:midi-Number(e.midi)};
+ return {...e,...pitchFieldsFromMidi(midi),tieStart:false,tieStop:false,intelligentOctaveShift:midi-Number(e.midi)};
 }
 
 // When the same pitch begins simultaneously in independent rhythms, expose the shorter
@@ -327,12 +353,13 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
  const literal=!!intelligence.literal;
  // Canonical rule: literal import owns rhythm. Intelligent mode may only change engraving
  // ownership (staff/voice/stem/chord). Pitch, onset and duration are immutable.
- const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
+ const sourceStreams=selectedStreams(parts,selected);if(!sourceStreams.length)throw Error('Select at least one voice.');
+ const streams=transformStreamsForEdition(sourceStreams,intelligence);
  const canonical=canonicalNoteSignature(streams);
  const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
  let measures='', emittedSignature=[];
  for(let m=0;m<=maxM;m++){
-  const timing=measureTiming(first,streams,m,maxM),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
+  const timing=editionMeasureTiming(first,streams,m,maxM,intelligence),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
   let body='',voiceCounter=0;
   const stems=stemAssignments(streams,m);
   // Outer pitch bounds are measured from the unmodified source texture for this measure.
@@ -355,7 +382,8 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
    // Octave transcription may alter/omit pitch only. It may not move or resize a source note.
    if(Number(e.start)!==Number(sourceEvent.start)||Number(e.dur)!==Number(sourceEvent.dur)||Number(e.measure||0)!==Number(sourceEvent.measure||0))throw Error('Octave transcription changed rhythmic placement.');
    emittedSignature.push([m,Number(e.start||0).toFixed(6),Number(e.dur||0).toFixed(6),Number(e.midi),String(e.step||''),Number(e.alter||0),Number(e.octave||0)].join('|'));
-   prepared.push({st,sourceEvent,e:{...e,engravingStaff:staff},staff,stem});
+   const sourceEventId=`m${m}-v${st.voiceNo}-s${Number(sourceEvent.start||0).toFixed(6)}-p${Number(sourceEvent.midi)}-d${Number(sourceEvent.dur||0).toFixed(6)}`;
+   prepared.push({st,sourceEvent,sourceEventId,e:{...e,engravingStaff:staff,sourceEventId},staff,stem});
   }
   // This engraving-only split is deliberately after source validation and octave processing:
   // it changes notation into tied segments without changing the source note's sounding span.
@@ -373,7 +401,11 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
      if(strength==='compact') role=staff===1?'up':'down';
      else if(strength==='balanced') role=staff===1?(e.midi>=67?'up':'down'):(e.midi>=53?'up':'down');
    }
-   const owner=literal?(hasBeam?`src${st.voiceNo}`:(role||`src${st.voiceNo}`)):(role||`src${st.voiceNo}`);
+   const baseOwner=literal?(hasBeam?`src${st.voiceNo}`:(role||`src${st.voiceNo}`)):(role||`src${st.voiceNo}`);
+   // A tied segment created to expose a shorter coincident rhythm must remain in its own
+   // logical voice. If it merges into another identical pitch/chord, Verovio can resolve the
+   // tie to a distant note and draw the huge arc seen with octave transcription.
+   const owner=(e.rhythmSplit||e.tieStart||e.tieStop)?`${baseOwner}|tie|${e.sourceEventId||st.voiceNo}`:baseOwner;
    const beamKey=literal?beamFamilyKey(e):'rebeam';
    const key=[staff,Number(e.start||0).toFixed(6),Number(e.dur||0).toFixed(6),owner,beamKey].join('|');
    if(!chordGroups.has(key))chordGroups.set(key,{staff,start:Number(e.start||0),dur:Number(e.dur||0),stem:role,owner,sourceVoice:st.voiceNo,beams:literal?(e.beams||[]):[],notes:[]});
@@ -391,12 +423,13 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
    // layer first, then any free layer. Only create an additional lane when independent
    // durations genuinely overlap and therefore cannot legally share a MusicXML voice.
    lane=lanes.find(l=>l.owner===g.owner && l.end<=g.start+.000001);
-   if(!lane && !literal && (g.owner==='up'||g.owner==='down')){
-     lane=lanes.find(l=>l.role===g.owner && l.end<=g.start+.000001);
+   const graphicalRole=g.stem==='up'||g.stem==='down'?g.stem:'';
+   if(!lane && !literal && graphicalRole){
+     lane=lanes.find(l=>l.role===graphicalRole && l.end<=g.start+.000001 && !String(g.owner).includes('|tie|'));
    }
    if(!lane) lane=lanes.find(l=>l.end<=g.start+.000001 && (literal?!(g.beams||[]).length:true));
-   if(!lane){lane={staff:g.staff,owner:g.owner,role:(g.owner==='up'||g.owner==='down')?g.owner:'',end:0,events:[]};lanes.push(lane);}
-   if(!lane.role && (g.owner==='up'||g.owner==='down'))lane.role=g.owner;
+   if(!lane){lane={staff:g.staff,owner:g.owner,role:graphicalRole,end:0,events:[]};lanes.push(lane);}
+   if(!lane.role && graphicalRole)lane.role=graphicalRole;
    lane.events.push(g);lane.end=Math.max(lane.end,g.start+g.dur);
   }
 
@@ -444,6 +477,35 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
  if(literal && (canonical.length!==emittedSignature.length || canonical.some((v,i)=>v!==emittedSignature[i])))throw Error('Literal transcription safety check failed: a note pitch, onset, or duration changed.');
  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
+
+function responseOutputText(j){
+ if(typeof j?.output_text==='string')return j.output_text;
+ return arr(j?.output).flatMap(o=>arr(o?.content)).filter(c=>c?.type==='output_text').map(c=>String(c.text||'')).join('\n');
+}
+function extractMusicXML(text=''){
+ const cleaned=String(text).replace(/^```(?:xml|musicxml)?\s*/i,'').replace(/```\s*$/,'').trim();
+ const start=cleaned.indexOf('<?xml')>=0?cleaned.indexOf('<?xml'):cleaned.indexOf('<score-partwise');
+ const end=cleaned.lastIndexOf('</score-partwise>');
+ if(start<0||end<0)throw Error('Visual transcription did not return a complete MusicXML score.');
+ return cleaned.slice(start,end+'</score-partwise>'.length);
+}
+app.post('/api/visual-transcribe',upload.single('visualScore'),async(req,res)=>{let fileId='';try{
+ if(!req.file)throw Error('Choose a PDF or score image first.');
+ const apiKey=process.env.OPENAI_API_KEY;
+ if(!apiKey)throw Error('Visual transcription needs OPENAI_API_KEY configured in Render.');
+ const mime=req.file.mimetype||(/\.pdf$/i.test(req.file.originalname)?'application/pdf':'image/png');
+ const fd=new FormData();fd.append('purpose','user_data');fd.append('file',new Blob([req.file.buffer],{type:mime}),req.file.originalname||'score.pdf');
+ const fr=await fetch('https://api.openai.com/v1/files',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`},body:fd});
+ const fj=await fr.json();if(!fr.ok)throw Error(fj?.error?.message||'Could not upload score for visual transcription.');fileId=fj.id;
+ const prompt=`You are an optical music recognition engine. Transcribe the attached printed music PDF/image into valid MusicXML 4.0 score-partwise XML. Return ONLY XML, no Markdown. Preserve every visible staff, voice, pitch, accidental, clef, key signature, meter, rest, beam, tie, barline, pickup, repeat, and note duration as faithfully as possible. IMPORTANT EARLY-MUSIC RULE: recognize breve/double-whole notes and rests. Encode a breve with <type>breve</type> and a duration equal to 8 quarter-note units at the chosen <divisions>; do not silently normalize a breve to a whole note. Preserve dotted breves where present. Recognize C, F, and G clefs when visible. If the source uses older-looking engraving but standard measurable notation, preserve the written rhythmic values rather than modernizing them. Use separate <voice> values for simultaneous independent rhythms. Ensure every measure's MusicXML duration is internally valid.`;
+ const rr=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},body:JSON.stringify({model:process.env.OMR_MODEL||'gpt-5.6-terra',input:[{role:'user',content:[{type:'input_file',file_id:fileId},{type:'input_text',text:prompt}]}],max_output_tokens:64000})});
+ const rj=await rr.json();if(!rr.ok)throw Error(rj?.error?.message||'Visual transcription failed.');
+ const xml=extractMusicXML(responseOutputText(rj));
+ const parsed=parseXML(Buffer.from(xml));
+ res.json({score:parsed,musicxml:xml,model:process.env.OMR_MODEL||'gpt-5.6-terra'});
+ }catch(e){console.error(e);res.status(400).json({error:e.message});}
+ finally{if(fileId&&process.env.OPENAI_API_KEY)fetch(`https://api.openai.com/v1/files/${encodeURIComponent(fileId)}`,{method:'DELETE',headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`}}).catch(()=>{});}
+});
 
 let toolkitPromise;
 async function getToolkit(){if(!toolkitPromise)toolkitPromise=createVerovioModule().then(m=>new VerovioToolkit(m));return toolkitPromise;}

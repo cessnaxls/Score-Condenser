@@ -9,3 +9,8 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 22.22.0
+
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OMR_MODEL
+        value: gpt-5.6-terra
