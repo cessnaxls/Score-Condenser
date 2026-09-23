@@ -132,17 +132,63 @@ function generatedBeams(es,beats,beatType){
  }
  return out;
 }
+function forwardXML(q,div,voiceNo,staff){if(q<=.0001)return '';return `<forward><duration>${Math.max(1,Math.round(q*div))}</duration><voice>${voiceNo}</voice><staff>${staff}</staff></forward>`;}
+
+// Build engraving lanes after condensation. Notes from different source voices that land
+// at the same onset, staff, duration and stem-role become ONE chord event. This prevents
+// doubled coincident stems and lets Verovio apply normal chord notehead displacement.
+function condensedLanes(streams,m){
+ const stems=stemAssignments(streams,m), raw=[];
+ for(const s of streams) for(const e of s.events.filter(e=>(e.measure||0)===m)){
+   const staff=e.midi>=60?1:2, stem=stems.get(`${s.voiceNo}|${m}|${e.start}`)||'';
+   raw.push({...e,sourceVoice:s.voiceNo,staff,stem});
+ }
+ const grouped=new Map();
+ for(const e of raw){
+   // Only explicitly compatible stem roles merge across source voices. Unassigned inner
+   // voices stay independent, even if they happen to share an onset/duration.
+   const role=e.stem || `independent-${e.sourceVoice}`;
+   const key=[e.staff,Number(e.start||0).toFixed(5),Number(e.dur||0).toFixed(5),role].join('|');
+   if(!grouped.has(key))grouped.set(key,{staff:e.staff,start:Number(e.start||0),dur:Number(e.dur||0),stem:e.stem,sourceVoice:e.sourceVoice,notes:[]});
+   grouped.get(key).notes.push(e);
+ }
+ // Stable lane identities are important for beaming. Up/down layers share a lane across
+ // measures; genuinely independent source voices retain their own lane.
+ const laneMap=new Map();
+ for(const g of grouped.values()){
+   const role=g.stem || `v${g.sourceVoice}`;
+   g.laneKey=`${g.staff}|${role}`;
+   g.midi=g.stem==='up'?Math.max(...g.notes.map(n=>n.midi)):Math.min(...g.notes.map(n=>n.midi));
+   if(!laneMap.has(g.laneKey))laneMap.set(g.laneKey,[]);
+   laneMap.get(g.laneKey).push(g);
+ }
+ return [...laneMap.entries()].map(([key,events])=>({key,staff:events[0].staff,events:events.sort((a,b)=>a.start-b.start||a.midi-b.midi)}));
+}
+
 function makeReduction(parts,selected,meta={}){
  const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
  const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],beats=Number(first?.meta?.beats||4),beatType=Number(first?.meta?.beatType||4),fifths=Number(first?.meta?.fifths||0),measureQ=beats*(4/beatType),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
+ // Give each logical engraving lane a stable MusicXML voice number across measures.
+ const laneVoiceNos=new Map(); let nextVoice=1;
+ for(let m=0;m<=maxM;m++) for(const lane of condensedLanes(streams,m)) if(!laneVoiceNos.has(lane.key))laneVoiceNos.set(lane.key,nextVoice++);
  let measures='';
  for(let m=0;m<=maxM;m++){
-  let body=''; const stems=stemAssignments(streams,m);
-  for(let si=0;si<streams.length;si++){
-   const s=streams[si],es=s.events.filter(e=>(e.measure||0)===m).sort((a,b)=>a.start-b.start||a.midi-b.midi);const beamMap=generatedBeams(es,beats,beatType);let cursor=0,i=0,lastStaff=si%2?2:1;
-   while(i<es.length){const start=Number(es[i].start||0);if(start>cursor+.0001)body+=restXML(start-cursor,s.voiceNo,div,lastStaff);const group=[];while(i<es.length&&Math.abs(Number(es[i].start||0)-start)<.0001)group.push(es[i++]);group.sort((a,b)=>a.midi-b.midi);group.forEach((e,j)=>{lastStaff=e.midi>=60?1:2;const stem=stems.get(`${s.voiceNo}|${m}|${e.start}`)||'';const idx=es.indexOf(e);body+=noteXML(e,s.voiceNo,div,j>0,stem,beamMap.get(idx)||[])});cursor=Math.max(cursor,start+Math.max(...group.map(e=>Number(e.dur||0))));}
-   if(cursor<measureQ-.0001)body+=restXML(measureQ-cursor,s.voiceNo,div,lastStaff);
-   if(si<streams.length-1)body+=`<backup><duration>${Math.round(measureQ*div)}</duration></backup>`;
+  let body=''; const lanes=condensedLanes(streams,m);
+  for(let li=0;li<lanes.length;li++){
+   const lane=lanes[li],voiceNo=laneVoiceNos.get(lane.key),es=lane.events;
+   const beamMap=generatedBeams(es,beats,beatType); let cursor=0;
+   for(let i=0;i<es.length;i++){
+     const g=es[i],start=Number(g.start||0);
+     // Silent positioning uses <forward>, not visible rests. These gaps are bookkeeping,
+     // not rests a keyboard player needs to see.
+     if(start>cursor+.0001)body+=forwardXML(start-cursor,div,voiceNo,lane.staff);
+     const notes=[...g.notes].sort((a,b)=>a.midi-b.midi);
+     const beams=beamMap.get(i)||[];
+     notes.forEach((e,j)=>{body+=noteXML(e,voiceNo,div,j>0,j===0?g.stem:'',j===0?beams:[])});
+     cursor=Math.max(cursor,start+Number(g.dur||0));
+   }
+   // Do not emit trailing bookkeeping rests. Backup returns to measure start for next lane.
+   if(li<lanes.length-1)body+=`<backup><duration>${Math.round(cursor*div)}</duration></backup>`;
   }
   const attrs=m===0?`<attributes><divisions>${div}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beats}</beats><beat-type>${beatType}</beat-type></time><staves>2</staves><part-symbol>brace</part-symbol><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>F</sign><line>4</line></clef></attributes>`:'';
   measures+=`<measure number="${m+1}">${attrs}${body}</measure>`;
@@ -156,5 +202,30 @@ function engravingGeometry(layout={}){const landscape=layout.orientation==='land
 function engravingOptions(layout={}){const {w,h}=engravingGeometry(layout),scale=Number(layout.scale||42),spacing=Number(layout.noteSpacing||1),stretch=Number(layout.barStretch||1),staff=Number(layout.staffSpacing||12),system=Number(layout.systemSpacing||10),margin=Number(layout.margin||60);return{pageWidth:w,pageHeight:h,pageMarginTop:margin,pageMarginBottom:margin,pageMarginLeft:margin,pageMarginRight:margin,scale,breaks:'auto',header:'auto',footer:'none',font:'Leipzig',spacingLinear:.25*spacing*stretch,spacingNonLinear:.6*spacing,spacingStaff:staff,spacingSystem:system,justifyVertically:false,systemDivider:'none'};}
 async function renderScore(body){const {parts,selected,meta={},layout={}}=body;const xml=makeReduction(parts,selected,meta);const tk=await getToolkit();tk.setOptions(engravingOptions(layout));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));return{xml,pages,layout};}
 app.post('/api/engrave',async(req,res)=>{try{const r=await renderScore(req.body);res.json({pages:r.pages,musicxml:r.xml,pageCount:r.pages.length});}catch(e){console.error(e);res.status(400).json({error:e.message})}});
-app.post('/api/pdf',async(req,res)=>{try{const r=await renderScore(req.body),g=engravingGeometry(r.layout);res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition','attachment; filename="keyboard-reduction.pdf"');const doc=new PDFDocument({autoFirstPage:false,compress:true,info:{Title:String(req.body?.meta?.title||'Keyboard reduction'),Author:String(req.body?.meta?.composer||'')}});doc.pipe(res);for(const svg of r.pages){doc.addPage({size:[g.pw,g.ph],margin:0});SVGtoPDF(doc,svg,0,0,{width:g.pw,height:g.ph,preserveAspectRatio:'xMidYMid meet'});}doc.end();}catch(e){console.error(e);if(!res.headersSent)res.status(400).json({error:e.message});else res.end();}});
+function svgGeometry(svg){
+ const m=svg.match(/viewBox=["']\s*([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s*["']/i);
+ if(!m)return null;return{x:+m[1],y:+m[2],w:+m[3],h:+m[4]};
+}
+function normalizeSvgForPdf(svg,vb){
+ // svg-to-pdfkit otherwise mixes Verovio's pixel-sized root with PDF points. Make the
+ // SVG's intrinsic dimensions equal to its viewBox, then apply exactly one explicit scale.
+ return svg.replace(/<svg\b([^>]*)>/i,(all,attrs)=>{
+   attrs=attrs.replace(/\s(?:width|height)=["'][^"']*["']/gi,'');
+   return `<svg${attrs} width="${vb.w}" height="${vb.h}">`;
+ });
+}
+app.post('/api/pdf',async(req,res)=>{try{
+ const r=await renderScore(req.body),g=engravingGeometry(r.layout);
+ res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition','attachment; filename="keyboard-reduction.pdf"');
+ const doc=new PDFDocument({autoFirstPage:false,compress:true,info:{Title:String(req.body?.meta?.title||'Keyboard reduction'),Author:String(req.body?.meta?.composer||'')}});doc.pipe(res);
+ for(const raw of r.pages){
+   doc.addPage({size:[g.pw,g.ph],margin:0});
+   const vb=svgGeometry(raw)||{x:0,y:0,w:g.w,h:g.h},svg=normalizeSvgForPdf(raw,vb);
+   const scale=Math.min(g.pw/vb.w,g.ph/vb.h),drawW=vb.w*scale,drawH=vb.h*scale,x=(g.pw-drawW)/2,y=(g.ph-drawH)/2;
+   doc.save();doc.translate(x,y);doc.scale(scale);doc.translate(-vb.x,-vb.y);
+   SVGtoPDF(doc,svg,0,0,{assumePt:true,preserveAspectRatio:'none'});
+   doc.restore();
+ }
+ doc.end();
+}catch(e){console.error(e);if(!res.headersSent)res.status(400).json({error:e.message});else res.end();}});
 app.listen(process.env.PORT||3000,()=>console.log('Score Condensor running with Verovio engraving'));
