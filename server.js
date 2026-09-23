@@ -35,7 +35,7 @@ function safeXmlParse(raw,extra={}){
   ignoreAttributes:false,attributeNamePrefix:'@_',parseTagValue:false,preserveOrder:false,
   // Critical for large OMR scores: do not expand entities. MusicXML structural parsing
   // does not require it, and this avoids fast-xml-parser's expansion-count guard.
-  processEntities:false,
+  processEntities:false,removeNSPrefix:true,
   ...extra
  }).parse(stripXmlDoctype(raw));
 }
@@ -580,10 +580,28 @@ function responseOutputText(j){
 }
 function extractMusicXML(text=''){
  const cleaned=String(text).replace(/^```(?:xml|musicxml)?\s*/i,'').replace(/```\s*$/,'').trim();
- const start=cleaned.indexOf('<?xml')>=0?cleaned.indexOf('<?xml'):cleaned.indexOf('<score-partwise');
- const end=cleaned.lastIndexOf('</score-partwise>');
- if(start<0||end<0)throw Error('Visual transcription did not return a complete MusicXML score.');
- return cleaned.slice(start,end+'</score-partwise>'.length);
+ // Accept ordinary or namespace-prefixed MusicXML roots. We strip only the root prefix;
+ // safeXmlParse(removeNSPrefix:true) handles any remaining prefixed element names.
+ const open=cleaned.match(/<(?:[A-Za-z_][\w.-]*:)?score-partwise\b/i);
+ const closes=[...cleaned.matchAll(/<\/(?:[A-Za-z_][\w.-]*:)?score-partwise\s*>/gi)];
+ if(!open||!closes.length){
+  if(/<(?:[A-Za-z_][\w.-]*:)?score-timewise\b/i.test(cleaned))throw Error('OMR returned score-timewise MusicXML instead of score-partwise. Verification was not run, so no second model call was charged.');
+  throw Error('OMR did not return a complete score-partwise MusicXML document. Verification was not run, so no second model call was charged.');
+ }
+ const start=open.index,endMatch=closes[closes.length-1],end=endMatch.index+endMatch[0].length;
+ let xml=cleaned.slice(start,end);
+ // Normalize a namespace prefix on the document root so downstream validators can use
+ // the same code path as uploaded MusicXML. Child prefixes are removed by the parser.
+ xml=xml.replace(/^<([A-Za-z_][\w.-]*):score-partwise\b/i,'<score-partwise')
+        .replace(/<\/([A-Za-z_][\w.-]*):score-partwise\s*>\s*$/i,'</score-partwise>');
+ return xml;
+}
+function validateOmrPartwise(xml=''){
+ const parsed=safeXmlParse(String(xml));
+ const score=parsed?.['score-partwise'];
+ if(!score)throw Error('OMR output is not a MusicXML score-partwise document.');
+ if(!score['part-list']||!arr(score.part).length)throw Error('OMR output is missing its part-list or musical parts.');
+ return true;
 }
 function sanitizeMusicOnlyXML(xml=''){
  // This is intentionally narrow: remove textual payloads while keeping musical
@@ -620,7 +638,8 @@ app.post('/api/visual-transcribe',upload.array('visualScores',20),async(req,res)
  const rr=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},body:JSON.stringify({model,input:[{role:'user',content:sourceContent}],reasoning:{effort:'high'},max_output_tokens:96000})});
  const rj=await rr.json();if(!rr.ok)throw Error(rj?.error?.message||'Visual transcription failed.');
  let xml=extractMusicXML(responseOutputText(rj));
- let verificationUsage=null;
+ validateOmrPartwise(xml); // Never spend a second model call trying to repair a structurally invalid first response.
+ let verificationUsage=null,verificationWarning='';
 
  if(verify){
   const audit=`Audit the draft MusicXML below against EVERY attached source image/PDF at symbol level, then return a COMPLETE corrected MusicXML 4.0 score-partwise document only. Do not explain changes.\n\nThis is a correction pass, not a creative transcription. Remove hallucinated/random notes. Correct every visibly mismatched pitch, octave, accidental, chord member, rest, onset and duration. Preserve source staff separation. Respect clefs and key signatures measure by measure. Check each measure from left to right against the pixels. Do not add lyrics or prose. Keep breves/long values literal. Ensure independent voices use <backup>/<forward> correctly. If the draft and source disagree, the SOURCE IMAGE wins.\n\nDRAFT MUSICXML:\n${xml}`;
@@ -628,15 +647,26 @@ app.post('/api/visual-transcribe',upload.array('visualScores',20),async(req,res)
   verifyContent.push({type:'input_text',text:audit});
   const vr=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},body:JSON.stringify({model,input:[{role:'user',content:verifyContent}],reasoning:{effort:'high'},max_output_tokens:96000})});
   const vj=await vr.json();if(!vr.ok)throw Error(vj?.error?.message||'OMR verification pass failed.');
-  xml=extractMusicXML(responseOutputText(vj)); verificationUsage=vj?.usage||null;
+  verificationUsage=vj?.usage||null;
+  try{
+   const checked=extractMusicXML(responseOutputText(vj));
+   validateOmrPartwise(checked);
+   xml=checked;
+  }catch(verifyShapeError){
+   // The first pass was already structurally valid. Do not throw away a paid successful
+   // transcription merely because the optional verifier returned prose/timewise/broken XML.
+   verificationWarning=`Verification output was unusable (${verifyShapeError.message}); kept the valid first-pass transcription.`;
+  }
  }
 
  if(musicOnly)xml=sanitizeMusicOnlyXML(xml);
+ validateOmrPartwise(xml);
  const parsed=parseXML(Buffer.from(xml));
  const noteCount=parsed.parts.reduce((n,p)=>n+p.events.filter(e=>!e.isRest).length,0);
  const eventCount=parsed.parts.reduce((n,p)=>n+p.events.length,0);
  const measureCount=parsed.measures||0;
  const warnings=[];
+ if(verificationWarning)warnings.push(verificationWarning);
  if(noteCount<10)warnings.push('OMR completeness warning: extremely few notes were recognized.');
  if(measureCount>=8&&noteCount/measureCount<2)warnings.push('OMR completeness warning: the result is suspiciously sparse; inspect it before condensing.');
  let timingIssues=0;
