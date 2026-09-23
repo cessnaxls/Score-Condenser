@@ -278,6 +278,26 @@ function beamFamilyKey(e){
  const beams=(e.beams||[]).map(b=>[Number(b.number||1),String(b.value||'')]);
  return JSON.stringify(beams);
 }
+
+function pitchFieldsFromMidi(midi){
+ const pc=((Number(midi)%12)+12)%12,oct=Math.floor(Number(midi)/12)-1;
+ const steps=['C','C','D','D','E','F','F','G','G','A','A','B'],alts=[0,1,0,1,0,0,1,0,1,0,1,0];
+ return {midi:Number(midi),step:steps[pc],alter:alts[pc],octave:oct};
+}
+function intelligentOctaveNormalize(e,staff,range){
+ // Intelligent-only pitch folding. Bass-staff candidates more than an octave above the
+ // measure's lowest bass pitch move down one octave; treble-staff candidates more than
+ // an octave below the measure's highest treble pitch move up one octave. Exactly one
+ // octave move is permitted. Rhythm is never changed. If that one move escapes the
+ // source texture's outer pitch bounds, omit the candidate.
+ let midi=Number(e.midi),shifted=false;
+ if(staff===2 && Number.isFinite(range.lowBass) && midi>range.lowBass+12){midi-=12;shifted=true;}
+ else if(staff===1 && Number.isFinite(range.highTreble) && midi<range.highTreble-12){midi+=12;shifted=true;}
+ if(shifted && ((Number.isFinite(range.highTreble)&&midi>range.highTreble)||(Number.isFinite(range.lowBass)&&midi<range.lowBass)))return null;
+ if(!shifted)return {...e};
+ return {...e,...pitchFieldsFromMidi(midi),intelligentOctaveShift:midi-Number(e.midi)};
+}
+
 function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
  // Canonical rule: literal import owns rhythm. Intelligent mode may only change engraving
  // ownership (staff/voice/stem/chord). Pitch, onset and duration are immutable.
@@ -289,16 +309,26 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
   const timing=measureTiming(first,streams,m,maxM),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
   let body='',voiceCounter=0;
   const stems=stemAssignments(streams,m);
+  const literal=!!intelligence.literal;
+  // Outer pitch bounds are measured from the unmodified source texture for this measure.
+  // They are anchors/guards only; Literal mode never calls the octave normalizer.
+  const sourceNotes=streams.flatMap(st=>st.events.filter(e=>(e.measure||0)===m&&!e.isRest));
+  const bassSource=sourceNotes.filter(e=>(e.sourceStaff||(e.midi>=60?1:2))===2).map(e=>Number(e.midi));
+  const trebleSource=sourceNotes.filter(e=>(e.sourceStaff||(e.midi>=60?1:2))===1).map(e=>Number(e.midi));
+  const octaveRange={lowBass:bassSource.length?Math.min(...bassSource):NaN,highTreble:trebleSource.length?Math.max(...trebleSource):NaN};
 
   // First make true simultaneous chord groups. A chord is legal only when onset, duration,
   // staff, stem-role and beam state agree. Exact duplicate pitches are de-duplicated visually
   // but still represented in the validation signature below.
   const chordGroups=new Map();
-  for(const st of streams) for(const e of st.events.filter(e=>(e.measure||0)===m&&!e.isRest)){
-   assertEventFits(e,targetQ,m,st.name);
+  for(const st of streams) for(const sourceEvent of st.events.filter(e=>(e.measure||0)===m&&!e.isRest)){
+   assertEventFits(sourceEvent,targetQ,m,st.name);
+   const staff=sourceEvent.sourceStaff||(sourceEvent.midi>=60?1:2),stem=stems.get(`${st.voiceNo}|${m}|${sourceEvent.start}`)||'';
+   const e=literal?{...sourceEvent}:intelligentOctaveNormalize(sourceEvent,staff,octaveRange);
+   if(!e)continue;
+   // Hard invariant: octave normalization may alter/omit pitch only. It may not move or resize a note.
+   if(Number(e.start)!==Number(sourceEvent.start)||Number(e.dur)!==Number(sourceEvent.dur)||Number(e.measure||0)!==Number(sourceEvent.measure||0))throw Error('Intelligent octave normalization changed rhythmic placement.');
    emittedSignature.push([m,Number(e.start||0).toFixed(6),Number(e.dur||0).toFixed(6),Number(e.midi),String(e.step||''),Number(e.alter||0),Number(e.octave||0)].join('|'));
-   const staff=e.sourceStaff||(e.midi>=60?1:2),stem=stems.get(`${st.voiceNo}|${m}|${e.start}`)||'';
-   const literal=!!intelligence.literal;
    const strength=String(intelligence.strength||'balanced');
    const hasBeam=(e.beams||[]).length>0;
    // Literal mode stays source-faithful except that simultaneous, rhythmically identical
@@ -380,7 +410,7 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
   measures+=`<measure number="${m+1}"${targetQ<timing.nominalQ-.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
  }
  emittedSignature.sort();
- if(canonical.length!==emittedSignature.length || canonical.some((v,i)=>v!==emittedSignature[i]))throw Error('Intelligent transcription safety check failed: a note pitch, onset, or duration changed.');
+ if(literal && (canonical.length!==emittedSignature.length || canonical.some((v,i)=>v!==emittedSignature[i])))throw Error('Literal transcription safety check failed: a note pitch, onset, or duration changed.');
  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
 
