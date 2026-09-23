@@ -299,6 +299,7 @@ function intelligentOctaveNormalize(e,staff,range){
 }
 
 function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
+ const literal=!!intelligence.literal;
  // Canonical rule: literal import owns rhythm. Intelligent mode may only change engraving
  // ownership (staff/voice/stem/chord). Pitch, onset and duration are immutable.
  const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
@@ -309,7 +310,6 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
   const timing=measureTiming(first,streams,m,maxM),beats=timing.beats,beatType=timing.beatType,targetQ=timing.targetQ;
   let body='',voiceCounter=0;
   const stems=stemAssignments(streams,m);
-  const literal=!!intelligence.literal;
   // Outer pitch bounds are measured from the unmodified source texture for this measure.
   // They are anchors/guards only; Literal mode never calls the octave normalizer.
   const sourceNotes=streams.flatMap(st=>st.events.filter(e=>(e.measure||0)===m&&!e.isRest));
@@ -355,7 +355,6 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
   const groups=[...chordGroups.values()].sort((a,b)=>a.staff-b.staff||a.start-b.start||b.dur-a.dur||a.owner.localeCompare(b.owner));
   for(const g of groups){
    const lanes=byStaff.get(g.staff);let lane=null;
-   const literal=!!intelligence.literal;
    // In intelligent mode, up/down are persistent engraving layers. Prefer the matching
    // layer first, then any free layer. Only create an additional lane when independent
    // durations genuinely overlap and therefore cannot legally share a MusicXML voice.
