@@ -41,10 +41,19 @@ function parseXML(buf){
    if(m.attributes?.key?.fifths!=null) fifths=Number(m.attributes.key.fifths)||0;
    const nominalQ=beats*(4/beatType);
    measureMeta[mi]={beats,beatType,fifths,nominalQ};
-   let cursor=0,lastStart=0;
+   // MusicXML polyphony is normally encoded by advancing one voice, using <backup>,
+   // then writing another voice from an earlier point in the same measure. fast-xml-parser's
+   // object form does not retain the interleaving of <note>/<backup>/<forward>, so a single
+   // measure-wide cursor incorrectly placed later voices after the end of the bar (for example
+   // an eighth note at 4.000 in 4/4). Keep an independent rhythmic cursor for each MusicXML
+   // voice instead. Rests in that voice advance its cursor exactly like sounded notes; chord
+   // members reuse that voice's previous onset and do not advance time.
+   const cursorByVoice=new Map(),lastStartByVoice=new Map();
    for(const n of arr(m.note)){
     const durDiv=Number(n.duration||0),dur=durDiv/divisions,v=String(n.voice||'1'); voices.add(v);
-    const start=n.chord!==undefined?lastStart:cursor; if(n.chord===undefined)lastStart=start;
+    const cursor=Number(cursorByVoice.get(v)||0),lastStart=Number(lastStartByVoice.get(v)||cursor);
+    const start=n.chord!==undefined?lastStart:cursor;
+    if(n.chord===undefined)lastStartByVoice.set(v,start);
     if(n.pitch){
       const step=String(n.pitch.step),alt=Number(n.pitch.alter||0),oct=Number(n.pitch.octave),midi=(oct+1)*12+stepSemi[step]+alt;
       const beams=arr(n.beam).map(b=>typeof b==='object'?{number:Number(b['@_number']||1),value:String(b['#text']||'')}:{number:1,value:String(b)}).filter(b=>b.value);
@@ -52,7 +61,7 @@ function parseXML(buf){
     } else if(n.rest!==undefined && dur>0){
       events.push({voice:v,isRest:true,measure:mi,start,dur,type:String(n.type||''),dot:n.dot!==undefined,sourceStaff:Number(n.staff||0)||0,measureRest:typeof n.rest==='object'&&String(n.rest?.['@_measure']||'')==='yes'});
     }
-    if(n.chord===undefined)cursor+=dur;
+    if(n.chord===undefined)cursorByVoice.set(v,cursor+dur);
    }
    mi++;
   }
