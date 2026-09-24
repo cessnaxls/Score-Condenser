@@ -23,10 +23,28 @@ function xmlTagText(block,tag){
 }
 function xmlAttr(attrs,name){const m=String(attrs||'').match(new RegExp(`\\b${name}\\s*=\\s*["']([^"']*)["']`,'i'));return m?m[1]:'';}
 function stripXmlDoctype(raw=''){
- // MusicXML commonly carries a PUBLIC/DTD declaration. We never need DTD entity
- // expansion for score import, and disabling it also prevents entity-expansion limits
- // from being tripped by OMR/source text containing many escaped entities.
- return String(raw).replace(/<!DOCTYPE[^[]*(?:\[[\s\S]*?\]\s*)?>/gi,'');
+ // MusicXML commonly carries a PUBLIC/DTD declaration. Do not use a greedy regex here:
+ // a normal external DOCTYPE has no '[' character, so a pattern such as [^[]* can run
+ // all the way to the final '>' in the score and accidentally delete the document.
+ // Scan to the DOCTYPE's own closing '>' while respecting quotes and an optional internal
+ // subset. We never need the DTD itself because structural MusicXML parsing is entity-free.
+ let s=String(raw),out='',from=0;
+ for(;;){
+  const start=s.slice(from).search(/<!DOCTYPE/i);
+  if(start<0){out+=s.slice(from);break}
+  const a=from+start;out+=s.slice(from,a);
+  let quote='',depth=0,i=a+9;
+  for(;i<s.length;i++){
+   const ch=s[i];
+   if(quote){if(ch===quote)quote='';continue}
+   if(ch==='"'||ch==="'"){quote=ch;continue}
+   if(ch==='['){depth++;continue}
+   if(ch===']'&&depth>0){depth--;continue}
+   if(ch==='>'&&depth===0){i++;break}
+  }
+  from=i;
+ }
+ return out;
 }
 function decodeBasicXmlText(v=''){
  return String(v).replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'\"').replace(/&apos;/g,"'").replace(/&amp;/g,'&');
@@ -63,7 +81,7 @@ function parseXML(buf){
  // at incorrect horizontal positions after OMR. Read each measure's note/backup/forward stream
  // in source order instead. This applies equally to imported MusicXML and OMR output.
  const rawPartMap=new Map();
- for(const pm of raw.matchAll(/<part\b([^>]*)>([\s\S]*?)<\/part>/gi)){
+ for(const pm of raw.matchAll(/<part(?=\s|>)([^>]*)>([\s\S]*?)<\/part>/gi)){
   const id=xmlAttr(pm[1],'id'); if(id)rawPartMap.set(id,pm[2]);
  }
  const parts=[]; let globalMeasures=0;
