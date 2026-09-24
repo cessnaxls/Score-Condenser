@@ -231,8 +231,14 @@ function sourceMeasureEnd(streams,m){
 }
 function measureTiming(first,streams,m,maxM){
  const mm=first?.meta?.measureMeta?.[m]||{},beats=Number(mm.beats||first?.meta?.beats||4),beatType=Number(mm.beatType||first?.meta?.beatType||4),nominalQ=beats*(4/beatType),sourceEnd=sourceMeasureEnd(streams,m);
+ // The imported score is authoritative about the actual span of a measure. This matters for
+ // Renaissance/early-music editions and some Sibelius exports that intentionally contain an
+ // overfull bar (for example 4.5 quarter-note beats under a displayed 4/4 signature). Rejecting
+ // such a bar as "past 4.000" loses valid source rhythm. Likewise, first/last pickup bars keep
+ // their true shorter duration. Ordinary complete bars still use the notated meter duration.
  const shortEdge=(m===0||m===maxM)&&sourceEnd>.0001&&sourceEnd<nominalQ-.0001;
- return {beats,beatType,nominalQ,targetQ:shortEdge?sourceEnd:nominalQ};
+ const overfull=sourceEnd>nominalQ+.0001;
+ return {beats,beatType,nominalQ,targetQ:overfull?sourceEnd:(shortEdge?sourceEnd:nominalQ),overfull};
 }
 function assertEventFits(e,targetQ,m,label){const start=Number(e.start||0),end=start+Number(e.dur||0);if(start<-.0001||end>targetQ+.0001)throw Error(`Rhythmic validation failed in measure ${m+1}, ${label}: event ${start.toFixed(3)}–${end.toFixed(3)} exceeds ${targetQ.toFixed(3)} beats.`);}
 function padForward(cursor,targetQ,div,voiceNo,staff){return cursor<targetQ-.0001?forwardXML(targetQ-cursor,div,voiceNo,staff):'';}
@@ -263,7 +269,7 @@ function makeLiteralReduction(parts,selected,meta={}){
    if(si<streams.length-1)body+=`<backup><duration>${Math.round(targetQ*div)}</duration></backup>`;
   }
   const attrs=m===0?`<attributes><divisions>${div}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beats}</beats><beat-type>${beatType}</beat-type></time><staves>2</staves><part-symbol>brace</part-symbol><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>F</sign><line>4</line></clef></attributes>`:'';
-  measures+=`<measure number="${m+1}"${targetQ<timing.nominalQ-.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
+  measures+=`<measure number="${m+1}"${Math.abs(targetQ-timing.nominalQ)>.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
  }
  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
@@ -474,7 +480,7 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
    if(ri<restStreams.length-1)body+=`<backup><duration>${Math.round(targetQ*div)}</duration></backup>`;
   }
   const attrs=m===0?`<attributes><divisions>${div}</divisions><key><fifths>${fifths}</fifths></key><time><beats>${beats}</beats><beat-type>${beatType}</beat-type></time><staves>2</staves><part-symbol>brace</part-symbol><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>F</sign><line>4</line></clef></attributes>`:'';
-  measures+=`<measure number="${m+1}"${targetQ<timing.nominalQ-.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
+  measures+=`<measure number="${m+1}"${Math.abs(targetQ-timing.nominalQ)>.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
  }
  emittedSignature.sort();
  if(literal && (canonical.length!==emittedSignature.length || canonical.some((v,i)=>v!==emittedSignature[i])))throw Error('Literal transcription safety check failed: a note pitch, onset, or duration changed.');

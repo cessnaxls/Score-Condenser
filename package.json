@@ -1,6 +1,6 @@
 {
   "name": "score-condensor",
-  "version": "2.8.0",
+  "version": "2.8.2",
   "private": true,
   "type": "module",
   "scripts": {
