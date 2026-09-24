@@ -83,17 +83,7 @@ function parseXML(buf){
 }
 function parseMidi(buf){const m=new Midi(buf);let max=0;const parts=m.tracks.map((t,i)=>({id:String(i),name:t.name||`Track ${i+1}`,voices:[`ch ${t.channel+1}`],events:t.notes.map(n=>{const s=n.ticks/m.header.ppq,d=n.durationTicks/m.header.ppq;max=Math.max(max,s+d);const pc=n.midi%12,oct=Math.floor(n.midi/12)-1,steps=['C','C','D','D','E','F','F','G','G','A','A','B'],alts=[0,1,0,1,0,0,1,0,1,0,1,0];return{voice:`ch ${t.channel+1}`,midi:n.midi,step:steps[pc],alter:alts[pc],octave:oct,measure:Math.floor(s/4),start:s%4,dur:d,type:''}}),meta:{beats:4,beatType:4,fifths:0,measures:Math.ceil(max/4)}}));return{kind:'midi',parts,measures:Math.ceil(max/4)}}
 async function parseMXL(buf){const zip=await JSZip.loadAsync(buf);let rootPath='';const ce=zip.file('META-INF/container.xml');if(ce){const c=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_'}).parse(await ce.async('string'));const roots=arr(c?.container?.rootfiles?.rootfile);rootPath=roots.find(r=>String(r?.['@_media-type']||'').includes('musicxml'))?.['@_full-path']||roots[0]?.['@_full-path']||'';}if(!rootPath)rootPath=Object.keys(zip.files).find(n=>!zip.files[n].dir&&/\.(musicxml|xml)$/i.test(n)&&!/^META-INF\//i.test(n))||'';if(!rootPath||!zip.file(rootPath))throw Error('This .mxl archive does not contain a readable MusicXML score.');return parseXML(await zip.file(rootPath).async('nodebuffer'));}
-app.post('/api/import',upload.single('score'),async(req,res)=>{try{if(!req.file)throw Error('Choose a score file first.');const b=req.file.buffer,n=req.file.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise');let parsed;if(midi)parsed=parseMidi(b);else if(zip)parsed=await parseMXL(b);else if(xml)parsed=parseXML(b);else if(/\.midi?$/.test(n))parsed=parseMidi(b);else if(/\.(mxl|musicxml|xml)$/.test(n))parsed=parseXML(b);else throw Error('Unsupported score file.');
- // Every imported score is rhythmically proofread before it ever reaches the transcription
- // pipeline. Rest notation is rebuilt from each source voice's actual sounding spans, so
- // malformed, redundant, overlapping, or awkwardly grouped source rests cannot contaminate
- // the keyboard reduction. Notes, ties, pitches and note durations are never changed here.
- if(parsed?.parts?.length){
-   const allKeys=parsed.parts.flatMap(p=>(p.voices||[]).map(v=>`${p.id}|${v}`));
-   const repaired=analyzeAndRepairRests(parsed.parts,allKeys);
-   parsed.parts=repaired.parts; parsed.importAnalysis=repaired.report;
- }
- res.json(parsed);}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/import',upload.single('score'),async(req,res)=>{try{if(!req.file)throw Error('Choose a score file first.');const b=req.file.buffer,n=req.file.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise');let parsed;if(midi)parsed=parseMidi(b);else if(zip)parsed=await parseMXL(b);else if(xml)parsed=parseXML(b);else if(/\.midi?$/.test(n))parsed=parseMidi(b);else if(/\.(mxl|musicxml|xml)$/.test(n))parsed=parseXML(b);else throw Error('Unsupported score file.');res.json(parsed);}catch(e){res.status(400).json({error:e.message})}});
 
 function selectedStreams(parts,selected){const streams=[];let v=1,order=0;for(const p of parts)for(const voice of p.voices){const key=`${p.id}|${voice}`;if(selected.includes(key))streams.push({voiceNo:v++,order:order++,name:`${p.name} · ${voice}`,events:p.events.filter(e=>e.voice===voice)});}return streams;}
 function typeFor(q){if(q>=4)return 'whole';if(q>=2)return 'half';if(q>=1)return 'quarter';if(q>=.5)return 'eighth';if(q>=.25)return '16th';return '32nd';}
@@ -332,53 +322,37 @@ function analyzeAndRepairRests(parts,selected){
  const allEvents=cloned.flatMap(p=>p.events||[]),scoreMaxM=Math.max(0,...cloned.map(p=>Number(p?.meta?.measures||0)-1),...allEvents.map(e=>Number(e.measure||0)));
  const globalEnds=new Map();
  for(const e of allEvents){const m=Number(e.measure||0),end=Number(e.start||0)+Number(e.dur||0);globalEnds.set(m,Math.max(Number(globalEnds.get(m)||0),end));}
- let addedRests=0,removedRests=0,voicesChanged=0;const repairedMeasureKeys=new Set(),details=[];
+ let addedRests=0,voicesChanged=0;const repairedMeasureKeys=new Set(),details=[];
  for(const p of cloned){
   for(const voice of p.voices||[]){
    const key=`${p.id}|${voice}`;if(!selectedSet.has(key))continue;
-   const originalVoice=(p.events||[]).filter(e=>String(e.voice)===String(voice));
-   const notes=originalVoice.filter(e=>!e.isRest),oldRests=originalVoice.filter(e=>e.isRest);
-   const rebuilt=[];let voiceChanged=false;
+   const voiceEvents=(p.events||[]).filter(e=>String(e.voice)===String(voice));let voiceAdded=0;
    const measureCount=Math.max(Number(p?.meta?.measures||0),scoreMaxM+1);
    for(let m=0;m<measureCount;m++){
     const mm=p?.meta?.measureMeta?.[m]||{},beats=Number(mm.beats||p?.meta?.beats||4),beatType=Number(mm.beatType||p?.meta?.beatType||4),nominalQ=Number(mm.nominalQ||beats*(4/beatType));
     const globalEnd=Number(globalEnds.get(m)||0),shortEdge=(m===0||m===scoreMaxM)&&globalEnd>EPS&&globalEnd<nominalQ-EPS,targetQ=globalEnd>nominalQ+EPS?globalEnd:(shortEdge?globalEnd:nominalQ);
     if(targetQ<=EPS)continue;
-    // Sounding spans, not source rest glyphs, define where silence actually exists. This lets
-    // us repair files whose rest notation is fragmented, redundant or metrically misleading.
-    const occupied=notes.filter(e=>Number(e.measure||0)===m&&Number(e.dur||0)>EPS).map(e=>[Math.max(0,Number(e.start||0)),Math.min(targetQ,Number(e.start||0)+Number(e.dur||0))]).filter(([a,b])=>b>a+EPS).sort((a,b)=>a[0]-b[0]||b[1]-a[1]);
+    const occupied=voiceEvents.filter(e=>Number(e.measure||0)===m&&Number(e.dur||0)>EPS).map(e=>[Math.max(0,Number(e.start||0)),Math.min(targetQ,Number(e.start||0)+Number(e.dur||0))]).filter(([a,b])=>b>a+EPS).sort((a,b)=>a[0]-b[0]||b[1]-a[1]);
     const merged=[];for(const iv of occupied){if(!merged.length||iv[0]>merged[merged.length-1][1]+EPS)merged.push([...iv]);else merged[merged.length-1][1]=Math.max(merged[merged.length-1][1],iv[1]);}
     const gaps=[];let cursor=0;for(const [a,b] of merged){if(a>cursor+EPS)gaps.push([cursor,a]);cursor=Math.max(cursor,b);}if(cursor<targetQ-EPS)gaps.push([cursor,targetQ]);
-    const oldMeasureRests=oldRests.filter(e=>Number(e.measure||0)===m);
-    const fresh=[];
+    if(!gaps.length)continue;
+    let measureAdded=0;
     for(const [a,b] of gaps){
      const fullMeasure=a<EPS&&Math.abs(b-targetQ)<EPS&&Math.abs(targetQ-nominalQ)<EPS;
      const pieces=fullMeasure?[{start:0,dur:targetQ,type:'whole',dot:false,measureRest:true}]:decomposeRestGap(a,b,beats,beatType);
      for(const piece of pieces){
-      const rest={voice:String(voice),isRest:true,measure:m,start:piece.start,dur:piece.dur,type:piece.type,dot:!!piece.dot,sourceStaff:nearestRestStaff(notes,m,piece.start),measureRest:!!piece.measureRest,analyzedRest:true};
-      if(piece.irregularRest)rest.irregularRest=true;fresh.push(rest);
+      const rest={voice:String(voice),isRest:true,measure:m,start:piece.start,dur:piece.dur,type:piece.type,dot:!!piece.dot,sourceStaff:nearestRestStaff(voiceEvents,m,piece.start),measureRest:!!piece.measureRest,analyzedRest:true};
+      if(piece.irregularRest)rest.irregularRest=true;
+      p.events.push(rest);voiceEvents.push(rest);addedRests++;voiceAdded++;measureAdded++;
      }
     }
-    const sig=r=>[Number(r.start||0).toFixed(6),Number(r.dur||0).toFixed(6),String(r.type||''),!!r.dot,!!r.measureRest].join('|');
-    const before=oldMeasureRests.map(sig).sort(),after=fresh.map(sig).sort();
-    const changed=before.length!==after.length||before.some((x,i)=>x!==after[i]);
-    if(changed){
-      voiceChanged=true;repairedMeasureKeys.add(`${p.id}|${voice}|${m}`);
-      const beforeSet=new Set(before),afterSet=new Set(after);
-      const removed=before.filter(x=>!afterSet.has(x)).length,added=after.filter(x=>!beforeSet.has(x)).length;
-      removedRests+=removed;addedRests+=added;
-      details.push({part:p.name,voice:String(voice),measure:m+1,restsBefore:before.length,restsAfter:after.length,added,removed});
-    }
-    rebuilt.push(...fresh);
+    if(measureAdded){repairedMeasureKeys.add(`${p.id}|${m}`);details.push({part:p.name,voice:String(voice),measure:m+1,restsAdded:measureAdded});}
    }
-   if(voiceChanged)voicesChanged++;
-   // Replace only this voice's rest events; preserve every note event byte-for-byte in our
-   // internal representation, including imported ties and beam metadata.
-   p.events=(p.events||[]).filter(e=>String(e.voice)!==String(voice)||!e.isRest).concat(rebuilt);
+   if(voiceAdded)voicesChanged++;
   }
   p.events.sort((a,b)=>Number(a.measure||0)-Number(b.measure||0)||Number(a.start||0)-Number(b.start||0)||(a.isRest?1:0)-(b.isRest?1:0));
  }
- return {parts:cloned,report:{addedRests,removedRests,voicesChanged,measuresRepaired:repairedMeasureKeys.size,details}};
+ return {parts:cloned,report:{addedRests,voicesChanged,measuresRepaired:repairedMeasureKeys.size,details}};
 }
 app.post('/api/analyze',(req,res)=>{try{
  const parts=Array.isArray(req.body?.parts)?req.body.parts:[],selected=Array.isArray(req.body?.selected)?req.body.selected:[];
