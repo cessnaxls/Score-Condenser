@@ -23,15 +23,20 @@ function parseXML(buf){
  const credits=arr(score.credit).flatMap(c=>arr(c?.['credit-words']).map(w=>typeof w==='object'?String(w['#text']||''):String(w))).map(v=>v.trim()).filter(Boolean);
  const creators=arr(score.identification?.creator);
  const composerNode=creators.find(c=>typeof c==='object'&&String(c['@_type']||'').toLowerCase()==='composer')||creators[0];
- const composer=typeof composerNode==='object'?String(composerNode?.['#text']||''):String(composerNode||'');
+ const composerRaw=(typeof composerNode==='object'?String(composerNode?.['#text']||''):String(composerNode||'')).trim();
  const title=String(score.work?.['work-title']||score['movement-title']||credits[0]||'').trim();
  const movement=String(score['movement-title']||'').trim();
- const descriptiveCredit=credits.find(c=>c!==title && c!==composer && !/^\[?an[oó]nimo\]?$/i.test(c))||'';
+ const descriptiveCredit=credits.find(c=>c!==title && c!==composerRaw && !/^\[?an[oó]nimo\]?$/i.test(c) && !/^\d+$/i.test(c))||'';
  const subtitle=movement || descriptiveCredit;
  const rights=arr(score.identification?.rights).map(r=>typeof r==='object'?r['#text']:r).filter(Boolean).join(' · ');
  const source=String(score.identification?.source||'').trim();
- const dateMatch=(composer.match(/(?:c\.?\s*)?\d{3,4}\s*[–—-]\s*(?:c\.?\s*)?\d{2,4}/)||[])[0]||'';
- const cleanComposer=dateMatch?composer.replace(dateMatch,'').replace(/[(),;\s]+$/,'').trim():composer;
+ // Keep editorial credits out of the composer field and recognize both single circa dates
+ // ("c. 1500") and normal lifespan/date ranges. This source file, for example, encodes
+ // "Anonymous (c. 1500)\ned. Drew Sellis" in one composer element.
+ const composerLines=composerRaw.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+ const composerCore=(composerLines.find(x=>!/^ed\.?\s|^edited\s+by\b/i.test(x))||composerLines[0]||'').trim();
+ const dateMatch=(composerCore.match(/(?:c\.?\s*)?\d{3,4}(?:\s*[–—-]\s*(?:c\.?\s*)?\d{2,4})?/)||[])[0]||'';
+ const cleanComposer=(dateMatch?composerCore.replace(dateMatch,''):composerCore).replace(/[()\[\],;\s]+$/,'').replace(/\(\s*\)$/,'').trim();
  const parts=[]; let globalMeasures=0;
  for(const p of arr(score.part)){
   const voices=new Set(), events=[], measureMeta=[]; let divisions=1, beats=4, beatType=4, fifths=0, mi=0;
@@ -57,7 +62,13 @@ function parseXML(buf){
     if(n.pitch){
       const step=String(n.pitch.step),alt=Number(n.pitch.alter||0),oct=Number(n.pitch.octave),midi=(oct+1)*12+stepSemi[step]+alt;
       const beams=arr(n.beam).map(b=>typeof b==='object'?{number:Number(b['@_number']||1),value:String(b['#text']||'')}:{number:1,value:String(b)}).filter(b=>b.value);
-      events.push({voice:v,midi,step,alter:alt,octave:oct,measure:mi,start,dur:Math.max(dur,.0625),type:String(n.type||''),dot:n.dot!==undefined,beams,sourceStaff:Number(n.staff||0)||0,isRest:false});
+      // Preserve real MusicXML ties. Earlier builds only created ties for our own rhythmic
+      // splitting, so every imported tie in contrapuntal source material silently vanished.
+      // Read both the playback-level <tie> elements and notation-level <tied> elements, since
+      // exporters differ in which representation they include.
+      const tieTypes=[...arr(n.tie),...arr(n.notations?.tied)].map(t=>String(typeof t==='object'?(t?.['@_type']||t?.['#text']||''):t||'').toLowerCase()).filter(Boolean);
+      const tieStart=tieTypes.includes('start'),tieStop=tieTypes.includes('stop');
+      events.push({voice:v,midi,step,alter:alt,octave:oct,measure:mi,start,dur:Math.max(dur,.0625),type:String(n.type||''),dot:n.dot!==undefined,beams,tieStart,tieStop,sourceStaff:Number(n.staff||0)||0,isRest:false});
     } else if(n.rest!==undefined && dur>0){
       events.push({voice:v,isRest:true,measure:mi,start,dur,type:String(n.type||''),dot:n.dot!==undefined,sourceStaff:Number(n.staff||0)||0,measureRest:typeof n.rest==='object'&&String(n.rest?.['@_measure']||'')==='yes'});
     }
@@ -242,6 +253,113 @@ function measureTiming(first,streams,m,maxM){
 }
 function assertEventFits(e,targetQ,m,label){const start=Number(e.start||0),end=start+Number(e.dur||0);if(start<-.0001||end>targetQ+.0001)throw Error(`Rhythmic validation failed in measure ${m+1}, ${label}: event ${start.toFixed(3)}–${end.toFixed(3)} exceeds ${targetQ.toFixed(3)} beats.`);}
 function padForward(cursor,targetQ,div,voiceNo,staff){return cursor<targetQ-.0001?forwardXML(targetQ-cursor,div,voiceNo,staff):'';}
+
+// ANALYZE / REST REPAIR -------------------------------------------------------
+// Proofread each selected source voice as its own rhythmic timeline. Existing notes and rests
+// are treated as occupied spans; only genuinely uncovered gaps receive new rests. This is a
+// source-level repair pass, so both Literal and Intelligent engraving see the same repaired
+// voice afterwards and re-running Analyze is idempotent.
+const restValues=[
+ {q:4,type:'whole',dot:false},{q:3,type:'half',dot:true},{q:2,type:'half',dot:false},
+ {q:1.5,type:'quarter',dot:true},{q:1,type:'quarter',dot:false},{q:.75,type:'eighth',dot:true},
+ {q:.5,type:'eighth',dot:false},{q:.375,type:'16th',dot:true},{q:.25,type:'16th',dot:false},
+ {q:.1875,type:'32nd',dot:true},{q:.125,type:'32nd',dot:false},{q:.0625,type:'64th',dot:false}
+];
+function nearlyMultiple(x,u){if(!u)return true;return Math.abs(x/u-Math.round(x/u))<.0001;}
+function restMetricAlignment(start,q,beats,beatType){
+ const compound=beatType===8&&beats>3&&beats%3===0,primary=compound?1.5:(4/beatType),EPS=.0001;
+ if(q>=4)return Math.abs(start)<EPS;
+ if(q===3)return Math.abs(start)<EPS;
+ if(q===2)return !compound&&nearlyMultiple(start,2);
+ if(q===1.5)return compound&&nearlyMultiple(start,1.5);
+ // Values no longer than a primary beat may begin inside that beat, but they may not hide
+ // a primary beat boundary. This turns (for example) a 0.5–2.0 gap in 4/4 into an eighth
+ // rest followed by a quarter rest rather than a misleading dotted-quarter rest.
+ const pos=((start%primary)+primary)%primary,nextBoundary=pos<EPS?primary:primary-pos;
+ if(q>nextBoundary+EPS)return false;
+ if(q===1)return nearlyMultiple(start,compound?.5:1)||compound;
+ if(q===.75)return nearlyMultiple(start,.25);
+ if(q===.5)return nearlyMultiple(start,.5);
+ if(q===.375)return nearlyMultiple(start,.125);
+ if(q===.25)return nearlyMultiple(start,.25);
+ if(q===.1875)return nearlyMultiple(start,.0625);
+ if(q===.125)return nearlyMultiple(start,.125);
+ return nearlyMultiple(start,.0625);
+}
+function decomposeRestGap(start,end,beats,beatType){
+ const EPS=.0001,out=[];let cursor=start,guard=0;
+ while(cursor<end-EPS&&guard++<128){
+  const remain=end-cursor;
+  let spec=restValues.find(v=>v.q<=remain+EPS&&restMetricAlignment(cursor,v.q,beats,beatType));
+  // If imported rhythm lands off the normal binary grid, preserve the exact gap instead of
+  // silently changing time. The glyph is chosen from the nearest conventional rest value.
+  if(!spec){
+   const q=remain,near=[...restValues].sort((a,b)=>Math.abs(a.q-q)-Math.abs(b.q-q))[0];
+   out.push({start:cursor,dur:q,type:near.type,dot:near.dot,irregularRest:true});break;
+  }
+  // Do not let a rest cross the next primary beat boundary unless it begins on a boundary
+  // appropriate to that rest value. The alignment test above gives half/whole rests their
+  // normal strong-beat positions while splitting syncopated silence into readable values.
+  out.push({start:cursor,dur:Math.min(spec.q,remain),type:spec.type,dot:spec.dot});
+  cursor+=spec.q;
+ }
+ return out;
+}
+function nearestRestStaff(voiceEvents,m,start){
+ const notes=voiceEvents.filter(e=>!e.isRest&&Number.isFinite(Number(e.midi)));
+ if(!notes.length)return 1;
+ const same=notes.filter(e=>Number(e.measure||0)===m);
+ const pool=same.length?same:notes;
+ const n=[...pool].sort((a,b)=>{
+  const da=Math.abs(Number(a.measure||0)-m)*100+Math.abs(Number(a.start||0)-start);
+  const db=Math.abs(Number(b.measure||0)-m)*100+Math.abs(Number(b.start||0)-start);
+  return da-db;
+ })[0];
+ return Number(n.sourceStaff||0)||(Number(n.midi)>=60?1:2);
+}
+function analyzeAndRepairRests(parts,selected){
+ const cloned=JSON.parse(JSON.stringify(parts||[])),selectedSet=new Set(selected||[]),EPS=.0001;
+ const allEvents=cloned.flatMap(p=>p.events||[]),scoreMaxM=Math.max(0,...cloned.map(p=>Number(p?.meta?.measures||0)-1),...allEvents.map(e=>Number(e.measure||0)));
+ const globalEnds=new Map();
+ for(const e of allEvents){const m=Number(e.measure||0),end=Number(e.start||0)+Number(e.dur||0);globalEnds.set(m,Math.max(Number(globalEnds.get(m)||0),end));}
+ let addedRests=0,voicesChanged=0;const repairedMeasureKeys=new Set(),details=[];
+ for(const p of cloned){
+  for(const voice of p.voices||[]){
+   const key=`${p.id}|${voice}`;if(!selectedSet.has(key))continue;
+   const voiceEvents=(p.events||[]).filter(e=>String(e.voice)===String(voice));let voiceAdded=0;
+   const measureCount=Math.max(Number(p?.meta?.measures||0),scoreMaxM+1);
+   for(let m=0;m<measureCount;m++){
+    const mm=p?.meta?.measureMeta?.[m]||{},beats=Number(mm.beats||p?.meta?.beats||4),beatType=Number(mm.beatType||p?.meta?.beatType||4),nominalQ=Number(mm.nominalQ||beats*(4/beatType));
+    const globalEnd=Number(globalEnds.get(m)||0),shortEdge=(m===0||m===scoreMaxM)&&globalEnd>EPS&&globalEnd<nominalQ-EPS,targetQ=globalEnd>nominalQ+EPS?globalEnd:(shortEdge?globalEnd:nominalQ);
+    if(targetQ<=EPS)continue;
+    const occupied=voiceEvents.filter(e=>Number(e.measure||0)===m&&Number(e.dur||0)>EPS).map(e=>[Math.max(0,Number(e.start||0)),Math.min(targetQ,Number(e.start||0)+Number(e.dur||0))]).filter(([a,b])=>b>a+EPS).sort((a,b)=>a[0]-b[0]||b[1]-a[1]);
+    const merged=[];for(const iv of occupied){if(!merged.length||iv[0]>merged[merged.length-1][1]+EPS)merged.push([...iv]);else merged[merged.length-1][1]=Math.max(merged[merged.length-1][1],iv[1]);}
+    const gaps=[];let cursor=0;for(const [a,b] of merged){if(a>cursor+EPS)gaps.push([cursor,a]);cursor=Math.max(cursor,b);}if(cursor<targetQ-EPS)gaps.push([cursor,targetQ]);
+    if(!gaps.length)continue;
+    let measureAdded=0;
+    for(const [a,b] of gaps){
+     const fullMeasure=a<EPS&&Math.abs(b-targetQ)<EPS&&Math.abs(targetQ-nominalQ)<EPS;
+     const pieces=fullMeasure?[{start:0,dur:targetQ,type:'whole',dot:false,measureRest:true}]:decomposeRestGap(a,b,beats,beatType);
+     for(const piece of pieces){
+      const rest={voice:String(voice),isRest:true,measure:m,start:piece.start,dur:piece.dur,type:piece.type,dot:!!piece.dot,sourceStaff:nearestRestStaff(voiceEvents,m,piece.start),measureRest:!!piece.measureRest,analyzedRest:true};
+      if(piece.irregularRest)rest.irregularRest=true;
+      p.events.push(rest);voiceEvents.push(rest);addedRests++;voiceAdded++;measureAdded++;
+     }
+    }
+    if(measureAdded){repairedMeasureKeys.add(`${p.id}|${m}`);details.push({part:p.name,voice:String(voice),measure:m+1,restsAdded:measureAdded});}
+   }
+   if(voiceAdded)voicesChanged++;
+  }
+  p.events.sort((a,b)=>Number(a.measure||0)-Number(b.measure||0)||Number(a.start||0)-Number(b.start||0)||(a.isRest?1:0)-(b.isRest?1:0));
+ }
+ return {parts:cloned,report:{addedRests,voicesChanged,measuresRepaired:repairedMeasureKeys.size,details}};
+}
+app.post('/api/analyze',(req,res)=>{try{
+ const parts=Array.isArray(req.body?.parts)?req.body.parts:[],selected=Array.isArray(req.body?.selected)?req.body.selected:[];
+ if(!parts.length)throw Error('Import a score before running Analyze.');
+ if(!selected.length)throw Error('Select at least one voice to analyze.');
+ res.json(analyzeAndRepairRests(parts,selected));
+}catch(e){console.error(e);res.status(400).json({error:e.message})}});
 function makeLiteralReduction(parts,selected,meta={}){
  const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
  const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0],fifths=Number(first?.meta?.fifths||0),div=480,maxM=Math.max(0,...streams.flatMap(s=>s.events.map(e=>e.measure||0)));
@@ -332,6 +450,43 @@ function intelligentOctaveNormalize(e,staff,range){
 // When the same pitch begins simultaneously in independent rhythms, expose the shorter
 // rhythm by re-spelling the longer sounding note as tied segments. Example: a half-note C
 // against a quarter-note C becomes quarter C tied to quarter C. Sounding duration is unchanged.
+// Prefer a preceding longer note when a later, shorter note from another source voice
+// lands on the same written pitch with no gap. This handles two common condensation cases:
+//   1) the shorter note is wholly covered by the longer note; or
+//   2) the shorter note begins exactly where the longer note ends.
+// In either case the longer note is retained and the shorter duplicate attack is omitted.
+// Simultaneous different-duration notes are NOT handled here; they still go through
+// splitSamePitchRhythms() so the longer value can be tied/split to expose the shorter rhythm.
+function suppressTrailingShorterSamePitch(items){
+ const EPS=.0001;
+ const ordered=[...items].sort((a,b)=>
+  Number(a.e.start||0)-Number(b.e.start||0) ||
+  Number(b.e.dur||0)-Number(a.e.dur||0) ||
+  Number(a.e.midi||0)-Number(b.e.midi||0));
+ const kept=[];
+ for(const item of ordered){
+  const e=item.e,start=Number(e.start||0),dur=Number(e.dur||0),end=start+dur;
+  const voice=String(item.st?.voiceNo??'');
+  let suppressedBy=null;
+  for(const prior of kept){
+   const p=prior.e,pStart=Number(p.start||0),pDur=Number(p.dur||0),pEnd=pStart+pDur;
+   if(Number(p.midi)!==Number(e.midi))continue;
+   if(Number(prior.staff)!==Number(item.staff))continue;
+   if(String(prior.st?.voiceNo??'')===voice)continue;
+   if(start<=pStart+EPS)continue; // same-onset rhythms are intentionally preserved/split later
+   if(!(dur<pDur-EPS))continue;  // only the genuinely shorter later value is expendable
+   const fullyCovered=end<=pEnd+EPS && start<pEnd-EPS;
+   const directlyAfter=Math.abs(start-pEnd)<=EPS;
+   if(fullyCovered||directlyAfter){
+    if(!suppressedBy || pDur>Number(suppressedBy.e.dur||0))suppressedBy=prior;
+   }
+  }
+  if(suppressedBy)continue;
+  kept.push(item);
+ }
+ return kept;
+}
+
 function splitSamePitchRhythms(items){
  const buckets=new Map();
  for(const item of items){
@@ -357,6 +512,24 @@ function splitSamePitchRhythms(items){
   }
  }
  return out;
+}
+
+// When separate source voices collapse onto the same written notehead, retain every tie
+// endpoint carried by those voices instead of letting Map de-duplication discard one of them.
+function mergeDuplicateNotes(notes){
+ const merged=new Map();
+ for(const n of [...notes].sort((a,b)=>a.midi-b.midi)){
+  const key=`${n.midi}|${n.step}|${n.alter}|${n.octave}`;
+  if(!merged.has(key)){merged.set(key,{...n});continue;}
+  const prev=merged.get(key);
+  prev.tieStart=!!prev.tieStart||!!n.tieStart;
+  prev.tieStop=!!prev.tieStop||!!n.tieStop;
+  prev.dot=!!prev.dot||!!n.dot;
+  // A source tie is musically meaningful even if another coincident voice has no tie.
+  // Keep generated/source split metadata only as engraving bookkeeping.
+  prev.rhythmSplit=!!prev.rhythmSplit||!!n.rhythmSplit;
+ }
+ return [...merged.values()];
 }
 
 function keyboardStaffForPitch(e){ return Number(e?.midi)>=60?1:2; }
@@ -408,7 +581,10 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
   }
   // This engraving-only split is deliberately after source validation and octave processing:
   // it changes notation into tied segments without changing the source note's sounding span.
-  for(const preparedItem of splitSamePitchRhythms(prepared)){
+  // A later shorter duplicate pitch yields to the preceding longer value. Do this before
+  // same-onset rhythmic splitting so the two rules remain distinct and deterministic.
+  const precedenceFiltered=suppressTrailingShorterSamePitch(prepared);
+  for(const preparedItem of splitSamePitchRhythms(precedenceFiltered)){
    const {st,e,staff,stem}=preparedItem;
    const strength=String(intelligence.strength||'balanced');
    const hasBeam=(e.beams||[]).length>0;
@@ -463,7 +639,7 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
     const g=ordered[gi];
     if(g.start<cursor-.0001)throw Error(`Intelligent transcription overlap in measure ${m+1}: onset ${g.start.toFixed(3)} occurs before lane cursor ${cursor.toFixed(3)}.`);
     if(g.start>cursor+.0001)body+=forwardXML(g.start-cursor,div,voiceNo,staff);
-    const unique=[...new Map(g.notes.sort((a,b)=>a.midi-b.midi).map(n=>[`${n.midi}|${n.step}|${n.alter}|${n.octave}`,n])).values()];
+    const unique=mergeDuplicateNotes(g.notes);
     unique.forEach((e,j)=>body+=noteXML(e,voiceNo,div,j>0,j===0?g.stem:'',j===0?(laneBeams.get(gi)||[]):[]));
     cursor=g.start+g.dur;
    }

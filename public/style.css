@@ -6,3 +6,5 @@ select{width:100%;padding:11px;border:1px solid #cbc5b9;border-radius:6px;margin
 .subSwitch{margin-top:12px;padding-top:12px;border-top:1px solid #e5e0d6}
 
 .fieldHelp{display:block;margin-top:6px;color:var(--muted,#69707a);font-size:12px;line-height:1.35}
+
+.headActions{display:flex;gap:8px;align-items:center}.analysisStatus{font-size:12px;line-height:1.4;color:#706a60;background:#f7f5f0;border:1px solid #e7e3db;border-radius:7px;padding:10px 12px;margin:10px 0 6px}.analysisStatus.ok{color:#315c36;background:#f1f7f1;border-color:#cfe0cf}.analysisStatus.error{color:#8a2d28;background:#fbf1f0;border-color:#e8cbc8}.headActions .ghost{white-space:nowrap}
