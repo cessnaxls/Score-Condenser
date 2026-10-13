@@ -119,7 +119,7 @@ function mergeSystems(results){
  const xml='<?xml version="1.0" encoding="utf-8"?>\n'+builder.build(xmlDoc);
  return {xml,regions,partCount,measureCount:measureNumber};
 }
-export async function recognizeImages(files,{parseXML}){
+export async function recognizeImages(files,{parseXML,onProgress=()=>{}}){
  if(!process.env.OPENAI_API_KEY)throw Error('Set OPENAI_API_KEY in Render to use GPT sheet-music transcription.');
  if(!files.length||files.length>MAX_PAGES)throw Error('Choose 1–8 ordered PDF pages or photographs.');
  const pages=[];
@@ -133,6 +133,7 @@ export async function recognizeImages(files,{parseXML}){
  for(let i=0;i<pages.length;i++)systems.push(...await sliceSystems(pages[i],i+1));
  if(systems.length>MAX_SYSTEMS)throw Error('Too many score systems to verify in one job; split the document.');
  const results=[],warnings=[];let precedingParts=null;
+ onProgress({completed:0,total:systems.length,message:`Found ${systems.length} systems. Starting GPT recognition.`});
  for(const system of systems){
   if(system.warning)warnings.push(`Page ${system.page}: ${system.warning}`);
   const transcription=await queryGPT(system.data,system,precedingParts);
@@ -140,6 +141,7 @@ export async function recognizeImages(files,{parseXML}){
   if(precedingParts!==null&&precedingParts!==count)throw Error(`Staff count changes on page ${system.page} system ${system.system} (${precedingParts} vs ${count}). Review this system manually; automatic alignment is unsafe.`);
   precedingParts=count;
   results.push({...system,transcription,data:undefined});
+  onProgress({completed:results.length,total:systems.length,message:`Recognized system ${results.length} of ${systems.length} (page ${system.page}).`});
  }
  const merged=mergeSystems(results),parsed=parseXML(Buffer.from(merged.xml));
  const pitched=parsed.parts.flatMap(p=>p.events).filter(e=>!e.isRest).length;

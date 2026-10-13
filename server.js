@@ -1,4 +1,5 @@
 import express from 'express';
+import crypto from 'node:crypto';
 import multer from 'multer';
 import { XMLParser } from 'fast-xml-parser';
 import midiPkg from '@tonejs/midi';
@@ -113,7 +114,47 @@ function parseMidi(buf){
  return {kind:'midi',parts,measures:bars.length,metadata:{title:m.name||'',composer:''}};
 }
 async function parseMXL(buf){const zip=await JSZip.loadAsync(buf);if(Object.keys(zip.files).length>2000)throw Error('MXL archive has too many entries.');let rootPath='';const ce=zip.file('META-INF/container.xml');if(ce){const c=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_'}).parse(await ce.async('string'));const roots=arr(c?.container?.rootfiles?.rootfile);rootPath=roots.find(r=>String(r?.['@_media-type']||'').includes('musicxml'))?.['@_full-path']||roots[0]?.['@_full-path']||'';}if(!rootPath)rootPath=Object.keys(zip.files).find(n=>!zip.files[n].dir&&/\.(musicxml|xml)$/i.test(n)&&!/^META-INF\//i.test(n))||'';if(!rootPath||!zip.file(rootPath))throw Error('This .mxl archive does not contain a readable MusicXML score.');const data=await zip.file(rootPath).async('nodebuffer');if(data.length>40*1024*1024)throw Error('Uncompressed MusicXML exceeds 40 MB.');return parseXML(data);}
-app.post('/api/import',upload.array('score',8),async(req,res)=>{try{const files=req.files||[];if(!files.length)throw Error('Choose a score file first.');const f=files[0],b=f.buffer,n=f.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise')||head.startsWith('<score-timewise');let parsed;if(files.length>1||b.subarray(0,5).toString('latin1')==='%PDF-'||/\.(pdf|png|jpe?g|webp)$/.test(n))parsed=await recognizeImages(files,{parseXML});else if(midi)parsed=parseMidi(b);else if(zip)parsed=await parseMXL(b);else if(xml)parsed=parseXML(b);else if(/\.midi?$/.test(n))parsed=parseMidi(b);else if(/\.mxl$/.test(n))parsed=await parseMXL(b);else if(/\.(musicxml|musxml|xml)$/.test(n))parsed=parseXML(b);else throw Error('Unsupported score file.');res.json(parsed);}catch(e){res.status(400).json({error:e.message})}});
+// Short-running uploads remain synchronous. AI OMR is a queued in-process job so
+// Render can return immediately instead of timing out during multi-system requests.
+const omrJobs=new Map();
+let omrActive=false;
+const makeJobId=()=>crypto.randomUUID();
+const isImageFile=f=>/\.(png|jpe?g|webp)$/i.test(f.originalname||'');
+const isPdfFile=f=>/\.pdf$/i.test(f.originalname||'')||f.buffer.subarray(0,5).toString('ascii')==='%PDF-';
+function queueOmr(job,files){
+ job.state='queued';
+ const run=async()=>{
+  omrActive=true;job.state='processing';job.message='Recognizing score systems with GPT. This may take several minutes.';
+  try{job.result=await recognizeImages(files,{parseXML,onProgress:(p)=>{job.message=p.message||job.message;job.completed=p.completed||0;job.total=p.total||0;}});job.state='complete';job.message='Ready for proofreading';}
+  catch(e){job.state='failed';job.error=e.message||String(e);console.error('OMR job failed:',e);}
+  finally{omrActive=false;job.updated=Date.now();const next=[...omrJobs.values()].find(x=>x.state==='queued');if(next)queueMicrotask(()=>next.run());}
+ };
+ job.run=run;
+ if(!omrActive)queueMicrotask(run);
+}
+app.get('/api/import-jobs/:id',(req,res)=>{
+ const j=omrJobs.get(req.params.id);if(!j)return res.status(404).json({error:'Import job unavailable (server may have restarted). Please upload again.'});
+ res.set('Cache-Control','no-store');res.json({state:j.state,message:j.message,error:j.error||null,completed:j.completed||0,total:j.total||0,...(j.state==='complete'?{result:j.result}:{})});
+});
+app.post('/api/import',upload.array('score',8),async(req,res)=>{try{
+ const files=req.files||[];if(!files.length)throw Error('Choose a score file first.');
+ const images=files.every(f=>isImageFile(f)||isPdfFile(f));
+ if(files.length>1&&!images)throw Error('Select one MusicXML/MXL/MIDI file, or multiple PDF/photo files. Do not mix formats.');
+ if(images){
+  if(!process.env.OPENAI_API_KEY)throw Error('OPENAI_API_KEY is missing on Render. MusicXML, MXL and MIDI can still be imported without it.');
+  const id=makeJobId(),job={id,state:'queued',message:'Upload received',updated:Date.now(),completed:0,total:0,files:files.map(f=>f.originalname)};
+  omrJobs.set(id,job);
+  // Bound retained job results and error details; restart clears transient jobs.
+  while(omrJobs.size>15)omrJobs.delete(omrJobs.keys().next().value);
+  queueOmr(job,files);return res.status(202).json({jobId:id,state:'queued',message:'Upload complete. Recognition queued.'});
+ }
+ const f=files[0],b=f.buffer,n=f.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise')||head.startsWith('<score-timewise');
+ let parsed;
+ if(midi)parsed=parseMidi(b);else if(zip)parsed=await parseMXL(b);else if(xml)parsed=parseXML(b);else if(/\.midi?$/.test(n))parsed=parseMidi(b);else if(/\.mxl$/.test(n))parsed=await parseMXL(b);else if(/\.(musicxml|musxml|xml)$/.test(n))parsed=parseXML(b);else throw Error('Unsupported score file. Accepted: PDF, PNG, JPG, WebP, MXL, MusicXML, MUSXML, XML, MID and MIDI.');
+ res.json(parsed);
+ }catch(e){res.status(400).json({error:e.message})}});
+// Report malformed/multipart uploads and limits as JSON instead of an HTML 500 page.
+app.use((err,req,res,next)=>{if(err&&req.path==='/api/import')return res.status(400).json({error:err.code==='LIMIT_FILE_SIZE'?'File is larger than the 20 MB upload limit.':err.message||'Import failed'});next(err)});
 
 function selectedStreams(parts,selected){const streams=[];let v=1,order=0;for(const p of parts)for(const voice of p.voices){const key=`${p.id}|${voice}`;if(selected.includes(key))streams.push({voiceNo:v++,order:order++,name:`${p.name} · ${voice}`,events:p.events.filter(e=>e.voice===voice)});}return streams;}
 function typeFor(q){if(q>=16)return 'long';if(q>=8)return 'breve';if(q>=4)return 'whole';if(q>=2)return 'half';if(q>=1)return 'quarter';if(q>=.5)return 'eighth';if(q>=.25)return '16th';return '32nd';}

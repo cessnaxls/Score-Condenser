@@ -1,5 +1,33 @@
 let score=null,lastXML='',lastPages=[],lastPreviewLayout=null,timer=null,auditDecisions={};const $=s=>document.querySelector(s),file=$('#file'),parts=$('#parts');
-file.onchange=async()=>{if(!file.files[0])return;if(file.files.length>8){alert('Select at most eight photos/pages at once.');return;}$('#work').classList.add('hidden');$('#previewPanel').classList.add('hidden');const fd=new FormData();for(const f of file.files)fd.append('score',f);try{const r=await fetch('/api/import',{method:'POST',body:fd}),j=await r.json();if(!r.ok)throw Error(j.error);score=j;auditDecisions={};$('#pdfRecognition').classList.toggle('hidden',!j.recognition?.reviewRequired);$('#confirmOmr').checked=false;prefillMetadata(j.metadata||{});render();if(j.recognition){const x=j.recognition;$('#analysisStatus').textContent=`Recognized ${x.recognizedPages||'?'} page(s), ${x.recognizedSystems||'?'} system(s), ${x.recognizedNoteCount||'?'} pitched note entries. ${x.uncertainties?.length||0} flagged uncertainties. ALL measures require visual proofreading.` + (x.uncertainties?.length?' Details: '+x.uncertainties.join(' | '):'');}$('#work').classList.remove('hidden')}catch(e){alert(e.message)}};
+async function waitForImport(jobId){
+ for(;;){
+  await new Promise(resolve=>setTimeout(resolve,2500));
+  const r=await fetch('/api/import-jobs/'+encodeURIComponent(jobId),{cache:'no-store'});
+  const j=await r.json().catch(()=>({error:'Cannot read import status'}));
+  if(!r.ok)throw Error(j.error||'Unable to check import status');
+  $('#importStatus').textContent=j.message||j.state;
+  if(j.state==='complete')return j.result;
+  if(j.state==='failed')throw Error(j.error||'Music recognition failed');
+ }
+}
+file.onchange=async()=>{
+ if(!file.files.length)return;
+ if(file.files.length>8){alert('Select at most eight photos/pages at once.');return;}
+ $('#work').classList.add('hidden');$('#previewPanel').classList.add('hidden');
+ const status=$('#importStatus');status.textContent='Uploading '+file.files.length+' file(s)…';
+ file.disabled=true;
+ const fd=new FormData();for(const f of file.files)fd.append('score',f);
+ try{
+  const r=await fetch('/api/import',{method:'POST',body:fd});const j=await r.json().catch(()=>({error:'Server returned an invalid response. Check the Render logs.'}));
+  if(!r.ok)throw Error(j.error||'Import failed ('+r.status+')');
+  const imported=j.jobId?await waitForImport(j.jobId):j;
+  score=imported;auditDecisions={};$('#pdfRecognition').classList.toggle('hidden',!score.recognition?.reviewRequired);$('#confirmOmr').checked=false;
+  prefillMetadata(score.metadata||{});render();
+  if(score.recognition){const x=score.recognition;$('#analysisStatus').textContent=`Recognized ${x.recognizedPages||'?'} page(s), ${x.recognizedSystems||'?'} system(s), ${x.recognizedNoteCount||'?'} pitched note entries. ${x.uncertainties?.length||0} flagged uncertainties. ALL measures require visual proofreading.`+(x.uncertainties?.length?' Details: '+x.uncertainties.join(' | '):'');}
+  $('#work').classList.remove('hidden');status.textContent='Imported successfully: '+score.parts.length+' part(s).';
+ }catch(e){status.textContent='Import failed: '+e.message;alert(e.message)}finally{file.disabled=false;file.value='';}
+};
+
 function prefillMetadata(m){$('#title').value=m.title||'';$('#subtitle').value=m.subtitle||'';$('#collection').value=m.collection||'';$('#composer').value=m.composer||'';$('#dates').value=m.dates||'';}
 function render(){parts.innerHTML='';score.parts.forEach(p=>{const d=document.createElement('div'),partNotes=p.events.filter(e=>!e.isRest).length;d.className='part';d.innerHTML=`<div class="partTitle">${esc(p.name)} <small>· ${partNotes} notes</small></div>`;p.voices.forEach(v=>{const ev=p.events.filter(e=>e.voice===v),n=ev.filter(e=>!e.isRest).length,r=ev.filter(e=>e.isRest).length,row=document.createElement('div');row.className='voice';row.innerHTML=`<input class="pick" type="checkbox" checked data-key="${esc(p.id)}|${esc(v)}"><div><b>${p.voices.length===1?'Part':'Voice '+esc(v)}</b><br><small>${n} notes${r?` · ${r} rests`:''}</small></div><button class="solo">Solo</button><button class="mute">Mute</button>`;row.querySelector('.solo').onclick=()=>{document.querySelectorAll('.pick').forEach(x=>x.checked=false);row.querySelector('.pick').checked=true;schedulePreview()};row.querySelector('.mute').onclick=()=>{row.querySelector('.pick').checked=false;schedulePreview()};row.querySelector('.pick').onchange=schedulePreview;d.appendChild(row)});parts.appendChild(d)})}
 $('#all').onclick=()=>{document.querySelectorAll('.pick').forEach(x=>x.checked=true);schedulePreview()};
