@@ -18,7 +18,10 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 
 function parseXML(buf){
  const x=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_',parseTagValue:false,preserveOrder:false}).parse(buf.toString());
- const score=x['score-partwise']; if(!score) throw Error('This app expects a MusicXML score-partwise document.');
+ const score=x['score-partwise']; if(!score) throw Error('Expected MusicXML score-partwise. Export timewise scores as partwise MusicXML first.');
+ const orderedRoot=new XMLParser({ignoreAttributes:false,preserveOrder:true,parseTagValue:false}).parse(buf.toString());
+ const orderedScore=orderedRoot.find(n=>n['score-partwise'])?.['score-partwise']||[];
+ const orderedParts=orderedScore.filter(n=>n.part).map(n=>n.part);
  const names={}; for(const p of arr(score['part-list']?.['score-part'])) names[p['@_id']]=String(p['part-name']||p['@_id']);
  const credits=arr(score.credit).flatMap(c=>arr(c?.['credit-words']).map(w=>typeof w==='object'?String(w['#text']||''):String(w))).map(v=>v.trim()).filter(Boolean);
  const creators=arr(score.identification?.creator);
@@ -38,41 +41,43 @@ function parseXML(buf){
  const dateMatch=(composerCore.match(/(?:c\.?\s*)?\d{3,4}(?:\s*[–—-]\s*(?:c\.?\s*)?\d{2,4})?/)||[])[0]||'';
  const cleanComposer=(dateMatch?composerCore.replace(dateMatch,''):composerCore).replace(/[()\[\],;\s]+$/,'').replace(/\(\s*\)$/,'').trim();
  const parts=[]; let globalMeasures=0;
- for(const p of arr(score.part)){
+ for(const [partIndex,p] of arr(score.part).entries()){
   const voices=new Set(), events=[], measureMeta=[]; let divisions=1, beats=4, beatType=4, fifths=0, mi=0;
-  for(const m of arr(p.measure)){
+  for(const [measureIndex,m] of arr(p.measure).entries()){
    if(m.attributes?.divisions) divisions=Number(m.attributes.divisions)||divisions;
    if(m.attributes?.time){beats=Number(m.attributes.time.beats)||beats;beatType=Number(m.attributes.time['beat-type'])||beatType;}
    if(m.attributes?.key?.fifths!=null) fifths=Number(m.attributes.key.fifths)||0;
    const nominalQ=beats*(4/beatType);
    measureMeta[mi]={beats,beatType,fifths,nominalQ};
-   // MusicXML polyphony is normally encoded by advancing one voice, using <backup>,
-   // then writing another voice from an earlier point in the same measure. fast-xml-parser's
-   // object form does not retain the interleaving of <note>/<backup>/<forward>, so a single
-   // measure-wide cursor incorrectly placed later voices after the end of the bar (for example
-   // an eighth note at 4.000 in 4/4). Keep an independent rhythmic cursor for each MusicXML
-   // voice instead. Rests in that voice advance its cursor exactly like sounded notes; chord
-   // members reuse that voice's previous onset and do not advance time.
-   const cursorByVoice=new Map(),lastStartByVoice=new Map();
-   for(const n of arr(m.note)){
+   // Consume the original ordered MusicXML event stream: backup and forward
+   // change the timeline, while chord members share the preceding onset.
+   const orderedMeasure=(orderedParts[partIndex]||[]).filter(n=>n.measure)[measureIndex]?.measure||[];
+   const notes=arr(m.note); let noteIndex=0,cursor=0,lastStart=0;
+   const timeline=orderedMeasure.filter(n=>n.note||n.backup||n.forward);
+   // The fallback serves MusicXML producers that omit a proper ordered tree.
+   const entries=timeline.length?timeline.map(n=>({tag:Object.keys(n)[0],raw:n})):notes.map(n=>({tag:'note',note:n}));
+   for(const entry of entries){
+    if(entry.tag==='backup'||entry.tag==='forward'){
+     const raw=entry.raw?.[entry.tag]||[];
+     const durationNode=raw.find(n=>n.duration)?.duration?.[0];
+     const value=Number(durationNode?.['#text']||0)/divisions;
+     cursor=Math.max(0,cursor+(entry.tag==='backup'?-value:value));
+     continue;
+    }
+    const n=entry.note||notes[noteIndex++];if(!n)continue;
     const durDiv=Number(n.duration||0),dur=durDiv/divisions,v=String(n.voice||'1'); voices.add(v);
-    const cursor=Number(cursorByVoice.get(v)||0),lastStart=Number(lastStartByVoice.get(v)||cursor);
     const start=n.chord!==undefined?lastStart:cursor;
-    if(n.chord===undefined)lastStartByVoice.set(v,start);
+    if(n.chord===undefined)lastStart=start;
     if(n.pitch){
-      const step=String(n.pitch.step),alt=Number(n.pitch.alter||0),oct=Number(n.pitch.octave),midi=(oct+1)*12+stepSemi[step]+alt;
+      const step=String(n.pitch.step).toUpperCase(),alt=Number(n.pitch.alter||0),oct=Number(n.pitch.octave),midi=(oct+1)*12+stepSemi[step]+alt;
+      if(!Number.isFinite(midi))throw Error('Invalid MusicXML pitch in part '+p['@_id']);
       const beams=arr(n.beam).map(b=>typeof b==='object'?{number:Number(b['@_number']||1),value:String(b['#text']||'')}:{number:1,value:String(b)}).filter(b=>b.value);
-      // Preserve real MusicXML ties. Earlier builds only created ties for our own rhythmic
-      // splitting, so every imported tie in contrapuntal source material silently vanished.
-      // Read both the playback-level <tie> elements and notation-level <tied> elements, since
-      // exporters differ in which representation they include.
       const tieTypes=[...arr(n.tie),...arr(n.notations?.tied)].map(t=>String(typeof t==='object'?(t?.['@_type']||t?.['#text']||''):t||'').toLowerCase()).filter(Boolean);
-      const tieStart=tieTypes.includes('start'),tieStop=tieTypes.includes('stop');
-      events.push({voice:v,midi,step,alter:alt,octave:oct,measure:mi,start,dur:Math.max(dur,.0625),type:String(n.type||''),dot:n.dot!==undefined,beams,tieStart,tieStop,sourceStaff:Number(n.staff||0)||0,isRest:false});
-    } else if(n.rest!==undefined && dur>0){
+      events.push({voice:v,midi,step,alter:alt,octave:oct,measure:mi,start,dur:Math.max(dur,.0625),type:String(n.type||''),dot:n.dot!==undefined,beams,tieStart:tieTypes.includes('start'),tieStop:tieTypes.includes('stop'),sourceStaff:Number(n.staff||0)||0,isRest:false});
+    }else if(n.rest!==undefined && dur>0){
       events.push({voice:v,isRest:true,measure:mi,start,dur,type:String(n.type||''),dot:n.dot!==undefined,sourceStaff:Number(n.staff||0)||0,measureRest:typeof n.rest==='object'&&String(n.rest?.['@_measure']||'')==='yes'});
     }
-    if(n.chord===undefined)cursorByVoice.set(v,cursor+dur);
+    if(n.chord===undefined)cursor+=dur;
    }
    mi++;
   }
@@ -81,9 +86,31 @@ function parseXML(buf){
  }
  return {kind:'musicxml',parts,measures:globalMeasures,metadata:{title,subtitle,collection:source||rights,composer:cleanComposer,dates:dateMatch}};
 }
-function parseMidi(buf){const m=new Midi(buf);let max=0;const parts=m.tracks.map((t,i)=>({id:String(i),name:t.name||`Track ${i+1}`,voices:[`ch ${t.channel+1}`],events:t.notes.map(n=>{const s=n.ticks/m.header.ppq,d=n.durationTicks/m.header.ppq;max=Math.max(max,s+d);const pc=n.midi%12,oct=Math.floor(n.midi/12)-1,steps=['C','C','D','D','E','F','F','G','G','A','A','B'],alts=[0,1,0,1,0,0,1,0,1,0,1,0];return{voice:`ch ${t.channel+1}`,midi:n.midi,step:steps[pc],alter:alts[pc],octave:oct,measure:Math.floor(s/4),start:s%4,dur:d,type:''}}),meta:{beats:4,beatType:4,fifths:0,measures:Math.ceil(max/4)}}));return{kind:'midi',parts,measures:Math.ceil(max/4)}}
-async function parseMXL(buf){const zip=await JSZip.loadAsync(buf);let rootPath='';const ce=zip.file('META-INF/container.xml');if(ce){const c=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_'}).parse(await ce.async('string'));const roots=arr(c?.container?.rootfiles?.rootfile);rootPath=roots.find(r=>String(r?.['@_media-type']||'').includes('musicxml'))?.['@_full-path']||roots[0]?.['@_full-path']||'';}if(!rootPath)rootPath=Object.keys(zip.files).find(n=>!zip.files[n].dir&&/\.(musicxml|xml)$/i.test(n)&&!/^META-INF\//i.test(n))||'';if(!rootPath||!zip.file(rootPath))throw Error('This .mxl archive does not contain a readable MusicXML score.');return parseXML(await zip.file(rootPath).async('nodebuffer'));}
-app.post('/api/import',upload.single('score'),async(req,res)=>{try{if(!req.file)throw Error('Choose a score file first.');const b=req.file.buffer,n=req.file.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise');let parsed;if(midi)parsed=parseMidi(b);else if(zip)parsed=await parseMXL(b);else if(xml)parsed=parseXML(b);else if(/\.midi?$/.test(n))parsed=parseMidi(b);else if(/\.(mxl|musicxml|xml)$/.test(n))parsed=parseXML(b);else throw Error('Unsupported score file.');res.json(parsed);}catch(e){res.status(400).json({error:e.message})}});
+function parseMidi(buf){
+ const m=new Midi(buf),ppq=m.header.ppq||480;
+ const signatures=[...(m.header.timeSignatures||[])].map(t=>({ticks:t.ticks,beats:Number(t.timeSignature[0]),beatType:Number(t.timeSignature[1])})).filter(t=>t.beats>0&&t.beatType>0).sort((a,b)=>a.ticks-b.ticks);
+ if(!signatures.length||signatures[0].ticks>0)signatures.unshift({ticks:0,beats:4,beatType:4});
+ const maxTicks=Math.max(0,...m.tracks.flatMap(t=>t.notes.map(n=>n.ticks+n.durationTicks)));
+ const bars=[];let tick=0,si=0;
+ while(tick<=maxTicks && bars.length<100000){
+  while(si+1<signatures.length&&signatures[si+1].ticks<=tick)si++;
+  const sig=signatures[si],length=ppq*sig.beats*4/sig.beatType,next=signatures[si+1]?.ticks;
+  const end=Math.min(tick+length,next>tick?next:Infinity);
+  bars.push({tick,end,beats:sig.beats,beatType:sig.beatType,nominalQ:sig.beats*4/sig.beatType,fifths:0});tick=end;
+ }
+ const locate=t=>{let lo=0,hi=bars.length-1;while(lo<hi){const mid=Math.ceil((lo+hi)/2);if(bars[mid].tick<=t)lo=mid;else hi=mid-1;}return lo};
+ const parts=m.tracks.map((t,i)=>({id:String(i),name:t.name||`Track ${i+1}`,voices:[`ch ${t.channel+1}`],events:t.notes.flatMap(n=>{
+  const events=[];let remaining=n.durationTicks,pos=n.ticks,first=true;
+  while(remaining>0&&events.length<10000){const idx=locate(pos),bar=bars[idx],span=Math.min(remaining,bar.end-pos);if(span<=0)break;
+   const pc=n.midi%12,oct=Math.floor(n.midi/12)-1,steps=['C','C','D','D','E','F','F','G','G','A','A','B'],alts=[0,1,0,1,0,0,1,0,1,0,1,0,1,0];
+   events.push({voice:`ch ${t.channel+1}`,midi:n.midi,step:steps[pc],alter:alts[pc],octave:oct,measure:idx,start:(pos-bar.tick)/ppq,dur:span/ppq,type:'',tieStart:span<remaining,tieStop:!first,isRest:false});
+   remaining-=span;pos+=span;first=false;
+  }return events;
+ }),meta:{beats:bars[0]?.beats||4,beatType:bars[0]?.beatType||4,fifths:0,measures:bars.length,measureMeta:bars.map(({beats,beatType,nominalQ,fifths})=>({beats,beatType,nominalQ,fifths}))}}));
+ return {kind:'midi',parts,measures:bars.length,metadata:{title:m.name||'',composer:''}};
+}
+async function parseMXL(buf){const zip=await JSZip.loadAsync(buf);if(Object.keys(zip.files).length>2000)throw Error('MXL archive has too many entries.');let rootPath='';const ce=zip.file('META-INF/container.xml');if(ce){const c=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_'}).parse(await ce.async('string'));const roots=arr(c?.container?.rootfiles?.rootfile);rootPath=roots.find(r=>String(r?.['@_media-type']||'').includes('musicxml'))?.['@_full-path']||roots[0]?.['@_full-path']||'';}if(!rootPath)rootPath=Object.keys(zip.files).find(n=>!zip.files[n].dir&&/\.(musicxml|xml)$/i.test(n)&&!/^META-INF\//i.test(n))||'';if(!rootPath||!zip.file(rootPath))throw Error('This .mxl archive does not contain a readable MusicXML score.');const data=await zip.file(rootPath).async('nodebuffer');if(data.length>40*1024*1024)throw Error('Uncompressed MusicXML exceeds 40 MB.');return parseXML(data);}
+app.post('/api/import',upload.single('score'),async(req,res)=>{try{if(!req.file)throw Error('Choose a score file first.');const b=req.file.buffer,n=req.file.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise')||head.startsWith('<score-timewise');let parsed;if(midi)parsed=parseMidi(b);else if(zip)parsed=await parseMXL(b);else if(xml)parsed=parseXML(b);else if(/\.midi?$/.test(n))parsed=parseMidi(b);else if(/\.mxl$/.test(n))parsed=await parseMXL(b);else if(/\.(musicxml|musxml|xml)$/.test(n))parsed=parseXML(b);else throw Error('Unsupported score file.');res.json(parsed);}catch(e){res.status(400).json({error:e.message})}});
 
 function selectedStreams(parts,selected){const streams=[];let v=1,order=0;for(const p of parts)for(const voice of p.voices){const key=`${p.id}|${voice}`;if(selected.includes(key))streams.push({voiceNo:v++,order:order++,name:`${p.name} · ${voice}`,events:p.events.filter(e=>e.voice===voice)});}return streams;}
 function typeFor(q){if(q>=4)return 'whole';if(q>=2)return 'half';if(q>=1)return 'quarter';if(q>=.5)return 'eighth';if(q>=.25)return '16th';return '32nd';}
@@ -676,6 +703,30 @@ function engravingGeometry(layout={}){const landscape=layout.orientation==='land
 function engravingOptions(layout={}){const {w,h}=engravingGeometry(layout),scale=Number(layout.scale||42),spacing=Number(layout.noteSpacing||1),stretch=Number(layout.barStretch||1),staff=Number(layout.staffSpacing||12),system=Number(layout.systemSpacing||10),margin=Number(layout.margin||60);return{pageWidth:w,pageHeight:h,pageMarginTop:margin,pageMarginBottom:margin,pageMarginLeft:margin,pageMarginRight:margin,scale,breaks:'auto',header:'auto',footer:'none',font:'Leipzig',spacingLinear:.25*spacing*stretch,spacingNonLinear:.6*spacing,spacingStaff:staff,spacingSystem:system,justifyVertically:false,systemDivider:'none'};}
 async function renderScore(body){const {parts,selected,meta={},layout={},transcription={}}=body;const xml=makeReduction(parts,selected,meta,transcription);const tk=await getToolkit();tk.setOptions(engravingOptions(layout));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));return{xml,pages,layout};}
 app.post('/api/engrave',async(req,res)=>{try{const r=await renderScore(req.body);res.json({pages:r.pages,musicxml:r.xml,pageCount:r.pages.length});}catch(e){console.error(e);res.status(400).json({error:e.message})}});
+app.post('/api/export-midi',(req,res)=>{try{
+ const xml=makeReduction(req.body.parts,req.body.selected,req.body.meta||{},req.body.transcription||{});
+ const parsed=parseXML(Buffer.from(xml));const midi=new Midi();midi.header.setTempo(120);
+ const part=parsed.parts[0];if(!part)throw Error('Empty exported score.');
+ const bars=[];let tick=0;for(const m of part.meta.measureMeta){bars.push(tick);tick+=m.nominalQ*480;}
+ const byVoice=new Map();for(const e of part.events){if(e.isRest)continue;const key=e.voice;if(!byVoice.has(key))byVoice.set(key,[]);byVoice.get(key).push({...e,at:bars[e.measure]+Math.round(e.start*480)});}
+ for(const [voice,events] of byVoice){const track=midi.addTrack();track.name='Voice '+voice;const active=new Map(),merged=[];
+  for(const e of events.sort((a,b)=>a.at-b.at||a.midi-b.midi)){const k=e.midi;const existing=active.get(k);
+   if(existing && e.tieStop && existing.ticks+existing.durationTicks===e.at){existing.durationTicks+=Math.round(e.dur*480);if(!e.tieStart)active.delete(k);continue;}
+   const note={midi:e.midi,ticks:e.at,durationTicks:Math.max(1,Math.round(e.dur*480)),velocity:0.8};merged.push(note);
+   if(e.tieStart)active.set(k,note);
+  }
+  for(const note of merged)track.addNote(note);
+ }
+ // The MIDI representation retains pitches and timing, not visual engraving.
+ res.type('audio/midi').attachment('keyboard-reduction.mid').send(Buffer.from(midi.toArray()));
+}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/export-mxl',async(req,res)=>{try{
+ const xml=makeReduction(req.body.parts,req.body.selected,req.body.meta||{},req.body.transcription||{});
+ const zip=new JSZip();zip.file('mimetype','application/vnd.recordare.musicxml');
+ zip.file('META-INF/container.xml','<?xml version="1.0" encoding="utf-8"?><container><rootfiles><rootfile full-path="score.musicxml" media-type="application/vnd.recordare.musicxml+xml"/></rootfiles></container>');
+ zip.file('score.musicxml',xml);
+ res.type('application/vnd.recordare.musicxml').attachment('keyboard-reduction.mxl').send(await zip.generateAsync({type:'nodebuffer',compression:'DEFLATE'}));
+}catch(e){res.status(400).json({error:e.message})}});
 app.post('/api/pdf',async(req,res)=>{try{
  // PDF contains raster page images only. The browser rasterizes the exact rendered preview
  // page at Verovio's full page pixel dimensions; this endpoint simply places that PNG on
