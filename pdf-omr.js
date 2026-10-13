@@ -1,3 +1,4 @@
+import {symbolEvidence} from './omr-bridge.js';
 /** Linewise GPT optical music transcription. No Audiveris. Every image/system remains unverified until human proofread. */
 import {mkdtemp,writeFile,readdir,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
@@ -104,8 +105,8 @@ export async function analyzeStaffGeometry(buffer){
  }
  return {imageWidth:info.width,imageHeight:info.height,staffCount:staves.length,staves,confidence:staves.length?'staff-lines-detected':'uncertain',warning:staves.length?null:'Unable to identify consistent sets of five staff lines; GPT results require extra visual review.'};
 }
-async function queryGPT(image,system,previous,geometry=null,retryInstruction=""){
- const userText=`${geometry?.staffCount?'Geometric preflight detected '+geometry.staffCount+' sets of five staff lines at image y positions: '+geometry.staves.map((s,i)=>'staff '+(i+1)+': '+s.lines.join(',')).join('; ')+'. Use this only to locate staves, never as evidence for notes or pitches. ':''}Transcribe page ${system.page}, system ${system.system}, with ${system.staffCount||'unknown'} staff group(s). Preserve ALL visible notes of this system. ${previous?'The prior system had '+previous+' staves: maintain part order and identities.':''} Report unreadable markings specifically. Do not hallucinate. ${retryInstruction}`;
+async function queryGPT(image,system,previous,geometry=null,retryInstruction="",symbols=null){
+ const userText=`${symbols?.staffCount?'Computer vision independently detected '+symbols.staffCount+' staves and '+symbols.staves.reduce((n,s)=>n+s.noteheadCandidates.length,0)+' approximate filled notehead candidates. These are NOT certain notes; do not substitute them for visual inspection. ':''}${geometry?.staffCount?'Geometric preflight detected '+geometry.staffCount+' sets of five staff lines at image y positions: '+geometry.staves.map((s,i)=>'staff '+(i+1)+': '+s.lines.join(',')).join('; ')+'. Use this only to locate staves, never as evidence for notes or pitches. ':''}Transcribe page ${system.page}, system ${system.system}, with ${system.staffCount||'unknown'} staff group(s). Preserve ALL visible notes of this system. ${previous?'The prior system had '+previous+' staves: maintain part order and identities.':''} Report unreadable markings specifically. Do not hallucinate. ${retryInstruction}`;
  const request={model:process.env.OPENAI_OMR_MODEL||'gpt-4.1',temperature:0,response_format:{type:'json_object'},messages:[{role:'system',content:systemInstruction},{role:'user',content:[{type:'text',text:userText},{type:'image_url',image_url:{url:'data:image/png;base64,'+image.toString('base64'),detail:'high'}}]}],max_completion_tokens:16000};
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),Number(process.env.OMR_CALL_TIMEOUT_MS)||180000);
  let response;
@@ -203,7 +204,7 @@ export async function recognizeImages(files,{parseXML,onProgress=()=>{},mode='li
  const systems=[];
  for(let i=0;i<pages.length;i++)systems.push(...await sliceSystems(pages[i],i+1));
  if(systems.length>MAX_SYSTEMS)throw Error('Too many score systems to verify in one job; split the document.');
- const results=[],warnings=[],geometryReport=[];let precedingParts=null;
+ const results=[],warnings=[],geometryReport=[],symbolReports=[];let precedingParts=null;
  onProgress({completed:0,total:systems.length,message:`Found ${systems.length} systems. Starting GPT recognition.`});
  for(const system of systems){
   if(system.warning)warnings.push(`Page ${system.page}: ${system.warning}`);
@@ -212,7 +213,18 @@ export async function recognizeImages(files,{parseXML,onProgress=()=>{},mode='li
    if(geometry.warning)warnings.push(`Page ${system.page}, system ${system.system}: ${geometry.warning}`);
    if(system.staffCount&&geometry.staffCount&&system.staffCount!==geometry.staffCount)warnings.push(`Page ${system.page} system ${system.system}: image segmenter found ${system.staffCount} staves but OMR preflight found ${geometry.staffCount}. Check system cropping.`);
   }
-  let transcription=await queryGPT(system.data,system,precedingParts,geometry);
+  let symbols=null;
+  if(mode==='hybrid'){
+   try{symbols=await symbolEvidence(system.data);
+    symbolReports.push({page:system.page,system:system.system,staffCount:symbols.staffCount,
+      noteheadCandidates:symbols.staves.reduce((n,s)=>n+s.noteheadCandidates.length,0),
+      barlineCandidates:symbols.staves.map(s=>s.barlineCandidates.length),
+      staves:symbols.staves.map(s=>({lines:s.lines,spacing:s.spacing,
+        notes:s.noteheadCandidates.map(n=>({x:n.x,y:n.y,staffStep:n.staffStep,confidence:n.confidence})),
+        bars:s.barlineCandidates}))});
+   }catch(e){warnings.push(`Page ${system.page} system ${system.system}: symbol detector failed (${e.message}).`);}
+  }
+  let transcription=await queryGPT(system.data,system,precedingParts,geometry,null,symbols);
   normalizeDeclaredMultiRests(transcription);
   const counts=arr(transcription.doc.part).map(p=>arr(p.measure).length);
   if(new Set(counts).size>1){
@@ -238,7 +250,7 @@ export async function recognizeImages(files,{parseXML,onProgress=()=>{},mode='li
  }
  if(!pitched)throw Error('No pitched musical notes were recognized.');
  const uncertainties=results.flatMap(item=>item.transcription.uncertainties.map(s=>`Page ${item.page}, system ${item.system}: ${s}`));
- parsed.recognition={source:mode==='hybrid'?'geometry-assisted-gpt-omr':'gpt-vision-linewise',geometryReport,engine:process.env.OPENAI_OMR_MODEL||'gpt-4.1',reviewRequired:true,uncertainties:uncertainties.slice(0,300),warnings:[...warnings,'Optical transcription has not been independently proven note-for-note; proofread EACH staff and measure against the source before relying on the result.','The condensation audit verifies recognized data, not whether the AI recognized the printed notes correctly.'],recognizedPages:pages.length,recognizedSystems:systems.length,regions:merged.regions,recognizedNoteCount:pitched};
+ parsed.recognition={source:mode==='hybrid'?'geometry-assisted-gpt-omr':'gpt-vision-linewise',geometryReport,symbolReports,engine:process.env.OPENAI_OMR_MODEL||'gpt-4.1',reviewRequired:true,uncertainties:uncertainties.slice(0,300),warnings:[...warnings,'Optical transcription has not been independently proven note-for-note; proofread EACH staff and measure against the source before relying on the result.','The condensation audit verifies recognized data, not whether the AI recognized the printed notes correctly.'],recognizedPages:pages.length,recognizedSystems:systems.length,regions:merged.regions,recognizedNoteCount:pitched};
  // Show the original image next to recognized events. Reduce dimensions and data size;
  // the originals remain untouched during processing.
  parsed.sourcePages=await Promise.all(pages.map(async (page,i)=>({page:i+1, image:'data:image/jpeg;base64,'+(await sharp(page).rotate().resize({width:1400,withoutEnlargement:true}).jpeg({quality:76}).toBuffer()).toString('base64')})));

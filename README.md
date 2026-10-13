@@ -43,3 +43,7 @@ The AI **cannot be trusted to transcribe Renaissance/polyphonic printed scores n
 3. Change a pitch and onset; confirm the page review resets, corrected event validation succeeds, and a fresh preview is required.
 4. Audition and inspect the resulting MusicXML against a trusted human transcription of the **same** page.
 5. Only deploy as production once these tests pass on Render. A correct note-by-note GPT optical recognition benchmark is not yet established.
+
+
+## Symbol-level OMR add-on
+The hybrid mode now invokes `omr_engine.py` (OpenCV, without Audiveris) and retains `symbolReports` in its recognition metadata. It detects staff lines, potential filled noteheads and possible barlines; GPT remains responsible for clefs, rhythmic values and MusicXML interpretation. This evidence is NOT a complete trained OMR model or an accuracy guarantee. See `FULL-OMR.md`.
