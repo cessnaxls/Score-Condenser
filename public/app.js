@@ -16,7 +16,7 @@ file.onchange=async()=>{
  $('#work').classList.add('hidden');$('#previewPanel').classList.add('hidden');
  const status=$('#importStatus');status.textContent='Uploading '+file.files.length+' file(s)…';
  file.disabled=true;
- const fd=new FormData();for(const f of file.files)fd.append('score',f);
+ const fd=new FormData();for(const f of file.files)fd.append('score',f);fd.append('omrMode',$('#omrMode')?.value||'linewise');
  try{
   const r=await fetch('/api/import',{method:'POST',body:fd});const j=await r.json().catch(()=>({error:'Server returned an invalid response. Check the Render logs.'}));
   if(!r.ok)throw Error(j.error||'Import failed ('+r.status+')');

@@ -121,11 +121,11 @@ let omrActive=false;
 const makeJobId=()=>crypto.randomUUID();
 const isImageFile=f=>/\.(png|jpe?g|webp)$/i.test(f.originalname||'');
 const isPdfFile=f=>/\.pdf$/i.test(f.originalname||'')||f.buffer.subarray(0,5).toString('ascii')==='%PDF-';
-function queueOmr(job,files){
+function queueOmr(job,files,mode='linewise'){
  job.state='queued';
  const run=async()=>{
   omrActive=true;job.state='processing';job.message='Recognizing score systems with GPT. This may take several minutes.';
-  try{job.result=await recognizeImages(files,{parseXML,onProgress:(p)=>{job.message=p.message||job.message;job.completed=p.completed||0;job.total=p.total||0;}});job.state='complete';job.message='Ready for proofreading';}
+  try{job.result=await recognizeImages(files,{parseXML,mode,onProgress:(p)=>{job.message=p.message||job.message;job.completed=p.completed||0;job.total=p.total||0;}});job.state='complete';job.message='Ready for proofreading';}
   catch(e){job.state='failed';job.error=e.message||String(e);console.error('OMR job failed:',e);}
   finally{omrActive=false;job.updated=Date.now();const next=[...omrJobs.values()].find(x=>x.state==='queued');if(next)queueMicrotask(()=>next.run());}
  };
@@ -164,7 +164,7 @@ app.post('/api/import',upload.array('score',8),async(req,res)=>{try{
   omrJobs.set(id,job);
   // Bound retained job results and error details; restart clears transient jobs.
   while(omrJobs.size>15)omrJobs.delete(omrJobs.keys().next().value);
-  queueOmr(job,files);return res.status(202).json({jobId:id,state:'queued',message:'Upload complete. Recognition queued.'});
+  queueOmr(job,files,req.body?.omrMode==='hybrid'?'hybrid':'linewise');return res.status(202).json({jobId:id,state:'queued',message:'Upload complete. Recognition queued.'});
  }
  const f=files[0],b=f.buffer,n=f.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise')||head.startsWith('<score-timewise');
  let parsed;

@@ -10,7 +10,7 @@ const MAX_PAGES=8,MAX_BYTES=20*1024*1024,MAX_SYSTEMS=48;
 const parser=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_',parseTagValue:false});
 const builder=new XMLBuilder({ignoreAttributes:false,attributeNamePrefix:'@_',format:true,suppressEmptyNode:false});
 const arr=x=>x==null?[]:Array.isArray(x)?x:[x];
-export function pdfEngineStatus(){return {engine:'OpenAI vision · linewise',configured:!!process.env.OPENAI_API_KEY,pdfEnabled:true,photosEnabled:true,maxPages:MAX_PAGES,reviewRequired:true,method:'system crops with source-preserving MusicXML and structured diagnostics'};}
+export function pdfEngineStatus(){return {engine:'OpenAI vision · linewise + optional geometry-assisted OMR',configured:!!process.env.OPENAI_API_KEY,pdfEnabled:true,photosEnabled:true,maxPages:MAX_PAGES,reviewRequired:true,method:'system crops with source-preserving MusicXML and structured diagnostics'};}
 const systemInstruction=`You are transcribing one cropped HORIZONTAL MUSICAL SYSTEM from a printed score. Be a rigorous music copyist, not a composer. Transcribe EVERY visible musical symbol per staff and voice, reading LEFT-TO-RIGHT one measure at a time. Preserve the number and vertical order of staves/parts, clefs (including movable Renaissance C clefs), key signatures, mensuration/time signatures, accidentals, note spellings and octaves, chords, stems, rests, dots, ties, barlines, and note durations. Do not normalize historical notation, fill in imagined notes, change meter, transpose, or condense. Distinguish square breves (MusicXML type breve) and longae (MusicXML type long) from whole notes using the shape of the notehead. Beware of square rests, ligatures, early staff clefs and mensural notation; report ambiguity. Preserve lyric syllables under the correct notes if legible. Use backup/forward for simultaneous MusicXML voices. You may return fewer measures than expected ONLY if the crop is visibly incomplete, and must then report the missing region. The input is a single score system, not an entire page. Return a JSON object with EXACT keys: musicxml (complete MusicXML score-partwise with one part per visible staff and matching measures), uncertainties (array of concise references STAFF and local MEASURE and what is unreadable), staffCount (integer), measureCount (integer). Every part MUST appear in the part-list AND part body, even for multimeasure rests. Use divisions 10080; a breve lasting 8 quarter beats uses duration 80640, a longa lasting 16 quarter beats uses duration 161280 only in standard modern proportional interpretation; historical mensural values depend on context and must be flagged when uncertain. Do not invent a total measure count; include only measures actually shown. Return JSON, no prose or markdown.`;
 function isPDF(b){return b.subarray(0,5).toString('ascii')==='%PDF-'}
 async function pdfPngs(data){
@@ -76,8 +76,36 @@ async function sliceSystems(buffer,pageNumber){
  }
  return images;
 }
-async function queryGPT(image,system,previous){
- const userText=`Transcribe page ${system.page}, system ${system.system}, with ${system.staffCount||'unknown'} staff group(s). Preserve ALL visible notes of this system. ${previous?'The prior system had '+previous+' staves: maintain part order and identities.':''} Report unreadable markings specifically. Do not hallucinate.`;
+/** Deterministic image-geometry preflight. This locates long horizontal staff rulings,
+ * not note pitches; findings are advisory and never generate musical events. */
+export async function analyzeStaffGeometry(buffer){
+ const img=sharp(buffer,{limitInputPixels:160000000}).rotate();
+ const meta=await img.metadata(),width=Math.min(meta.width||0,1400);
+ if(width<100)throw Error('Score image is too small to locate staves.');
+ const {data,info}=await img.resize({width}).greyscale().raw().toBuffer({resolveWithObject:true});
+ const rows=[];const x0=Math.floor(info.width*.07),x1=Math.floor(info.width*.94);
+ for(let y=0;y<info.height;y++){
+  let ink=0;for(let x=x0;x<x1;x++)if(data[y*info.width+x]<145)ink++;
+  rows.push(ink/(x1-x0));
+ }
+ const peaks=[];let start=-1;
+ for(let y=0;y<=rows.length;y++){
+  const active=y<rows.length&&rows[y]>.44;
+  if(active&&start<0)start=y;
+  if(!active&&start>=0){peaks.push(Math.round((start+y-1)/2));start=-1;}
+ }
+ const staves=[];
+ for(let i=0;i+4<peaks.length;i++){
+  const subset=peaks.slice(i,i+5),ds=subset.slice(1).map((n,j)=>n-subset[j]);
+  const avg=ds.reduce((a,b)=>a+b,0)/4;
+  if(avg>=4&&avg<=30&&ds.every(d=>Math.abs(d-avg)<=Math.max(2,avg*.28))){
+   staves.push({lines:subset,spacing:Math.round(avg*10)/10});i+=4;
+  }
+ }
+ return {imageWidth:info.width,imageHeight:info.height,staffCount:staves.length,staves,confidence:staves.length?'staff-lines-detected':'uncertain',warning:staves.length?null:'Unable to identify consistent sets of five staff lines; GPT results require extra visual review.'};
+}
+async function queryGPT(image,system,previous,geometry=null){
+ const userText=`${geometry?.staffCount?'Geometric preflight detected '+geometry.staffCount+' sets of five staff lines at image y positions: '+geometry.staves.map((s,i)=>'staff '+(i+1)+': '+s.lines.join(',')).join('; ')+'. Use this only to locate staves, never as evidence for notes or pitches. ':''}Transcribe page ${system.page}, system ${system.system}, with ${system.staffCount||'unknown'} staff group(s). Preserve ALL visible notes of this system. ${previous?'The prior system had '+previous+' staves: maintain part order and identities.':''} Report unreadable markings specifically. Do not hallucinate.`;
  const request={model:process.env.OPENAI_OMR_MODEL||'gpt-4.1',temperature:0,response_format:{type:'json_object'},messages:[{role:'system',content:systemInstruction},{role:'user',content:[{type:'text',text:userText},{type:'image_url',image_url:{url:'data:image/png;base64,'+image.toString('base64'),detail:'high'}}]}],max_completion_tokens:16000};
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),Number(process.env.OMR_CALL_TIMEOUT_MS)||180000);
  let response;
@@ -119,7 +147,8 @@ function mergeSystems(results){
  const xml='<?xml version="1.0" encoding="utf-8"?>\n'+builder.build(xmlDoc);
  return {xml,regions,partCount,measureCount:measureNumber};
 }
-export async function recognizeImages(files,{parseXML,onProgress=()=>{}}){
+export async function recognizeImages(files,{parseXML,onProgress=()=>{},mode='linewise'}){
+ if(!['linewise','hybrid'].includes(mode))throw Error('Invalid OMR recognition mode');
  if(!process.env.OPENAI_API_KEY)throw Error('Set OPENAI_API_KEY in Render to use GPT sheet-music transcription.');
  if(!files.length||files.length>MAX_PAGES)throw Error('Choose 1–8 ordered PDF pages or photographs.');
  const pages=[];
@@ -132,11 +161,18 @@ export async function recognizeImages(files,{parseXML,onProgress=()=>{}}){
  const systems=[];
  for(let i=0;i<pages.length;i++)systems.push(...await sliceSystems(pages[i],i+1));
  if(systems.length>MAX_SYSTEMS)throw Error('Too many score systems to verify in one job; split the document.');
- const results=[],warnings=[];let precedingParts=null;
+ const results=[],warnings=[],geometryReport=[];let precedingParts=null;
  onProgress({completed:0,total:systems.length,message:`Found ${systems.length} systems. Starting GPT recognition.`});
  for(const system of systems){
   if(system.warning)warnings.push(`Page ${system.page}: ${system.warning}`);
-  const transcription=await queryGPT(system.data,system,precedingParts);
+  const geometry=mode==='hybrid'?await analyzeStaffGeometry(system.data):null;
+  if(geometry){geometryReport.push({page:system.page,system:system.system,staffCount:geometry.staffCount,confidence:geometry.confidence});
+   if(geometry.warning)warnings.push(`Page ${system.page}, system ${system.system}: ${geometry.warning}`);
+   if(system.staffCount&&geometry.staffCount&&system.staffCount!==geometry.staffCount)warnings.push(`Page ${system.page} system ${system.system}: image segmenter found ${system.staffCount} staves but OMR preflight found ${geometry.staffCount}. Check system cropping.`);
+  }
+  const transcription=await queryGPT(system.data,system,precedingParts,geometry);
+  if(geometry?.staffCount&&transcription.staffCount&&geometry.staffCount!==transcription.staffCount)
+   warnings.push(`Page ${system.page} system ${system.system}: detected ${geometry.staffCount} staves but AI reported ${transcription.staffCount}. Review for an omitted or invented staff.`);
   const count=arr(transcription.doc.part).length;
   if(precedingParts!==null&&precedingParts!==count)throw Error(`Staff count changes on page ${system.page} system ${system.system} (${precedingParts} vs ${count}). Review this system manually; automatic alignment is unsafe.`);
   precedingParts=count;
@@ -154,7 +190,7 @@ export async function recognizeImages(files,{parseXML,onProgress=()=>{}}){
  }
  if(!pitched)throw Error('No pitched musical notes were recognized.');
  const uncertainties=results.flatMap(item=>item.transcription.uncertainties.map(s=>`Page ${item.page}, system ${item.system}: ${s}`));
- parsed.recognition={source:'gpt-vision-linewise',engine:process.env.OPENAI_OMR_MODEL||'gpt-4.1',reviewRequired:true,uncertainties:uncertainties.slice(0,300),warnings:[...warnings,'Optical transcription has not been independently proven note-for-note; proofread EACH staff and measure against the source before relying on the result.','The condensation audit verifies recognized data, not whether the AI recognized the printed notes correctly.'],recognizedPages:pages.length,recognizedSystems:systems.length,regions:merged.regions,recognizedNoteCount:pitched};
+ parsed.recognition={source:mode==='hybrid'?'geometry-assisted-gpt-omr':'gpt-vision-linewise',geometryReport,engine:process.env.OPENAI_OMR_MODEL||'gpt-4.1',reviewRequired:true,uncertainties:uncertainties.slice(0,300),warnings:[...warnings,'Optical transcription has not been independently proven note-for-note; proofread EACH staff and measure against the source before relying on the result.','The condensation audit verifies recognized data, not whether the AI recognized the printed notes correctly.'],recognizedPages:pages.length,recognizedSystems:systems.length,regions:merged.regions,recognizedNoteCount:pitched};
  // Show the original image next to recognized events. Reduce dimensions and data size;
  // the originals remain untouched during processing.
  parsed.sourcePages=await Promise.all(pages.map(async (page,i)=>({page:i+1, image:'data:image/jpeg;base64,'+(await sharp(page).rotate().resize({width:1400,withoutEnlargement:true}).jpeg({quality:76}).toBuffer()).toString('base64')})));
