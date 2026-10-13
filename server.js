@@ -7,6 +7,7 @@ import JSZip from 'jszip';
 import createVerovioModule from 'verovio/wasm';
 import { VerovioToolkit } from 'verovio/esm';
 import PDFDocument from 'pdfkit';
+import { auditScore, applyAuditPatch } from './audit.js';
 
 const app=express();
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
@@ -702,12 +703,14 @@ async function getToolkit(){if(!toolkitPromise)toolkitPromise=createVerovioModul
 function engravingGeometry(layout={}){const landscape=layout.orientation==='landscape',base=layout.pageSize==='a4'?{w:2100,h:2970,pw:595.28,ph:841.89}:{w:2159,h:2794,pw:612,ph:792};return landscape?{w:base.h,h:base.w,pw:base.ph,ph:base.pw}:{w:base.w,h:base.h,pw:base.pw,ph:base.ph};}
 function engravingOptions(layout={}){const {w,h}=engravingGeometry(layout),scale=Number(layout.scale||42),spacing=Number(layout.noteSpacing||1),stretch=Number(layout.barStretch||1),staff=Number(layout.staffSpacing||12),system=Number(layout.systemSpacing||10),margin=Number(layout.margin||60);return{pageWidth:w,pageHeight:h,pageMarginTop:margin,pageMarginBottom:margin,pageMarginLeft:margin,pageMarginRight:margin,scale,breaks:'auto',header:'auto',footer:'none',font:'Leipzig',spacingLinear:.25*spacing*stretch,spacingNonLinear:.6*spacing,spacingStaff:staff,spacingSystem:system,justifyVertically:false,systemDivider:'none'};}
 async function renderScore(body){const {parts,selected,meta={},layout={},transcription={}}=body;const xml=makeReduction(parts,selected,meta,transcription);const tk=await getToolkit();tk.setOptions(engravingOptions(layout));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));return{xml,pages,layout};}
+app.post('/api/audit',(req,res)=>{try{res.json(auditScore(req.body,parseXML));}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/audit/apply',async(req,res)=>{try{const before=auditScore(req.body,parseXML),issue=before.issues.find(x=>x.id===req.body.issueId);if(!issue)throw Error('Correction is no longer current. Run the audit again.');const xml=applyAuditPatch(req.body.xml,issue);const after=auditScore({...req.body,xml},parseXML);const tk=await getToolkit();tk.setOptions(engravingOptions(req.body.layout||{}));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));res.json({musicxml:xml,pages,pageCount:pages.length,audit:after});}catch(e){res.status(400).json({error:e.message})}});
 app.post('/api/engrave',async(req,res)=>{try{const r=await renderScore(req.body);res.json({pages:r.pages,musicxml:r.xml,pageCount:r.pages.length});}catch(e){console.error(e);res.status(400).json({error:e.message})}});
 app.post('/api/export-midi',(req,res)=>{try{
- const xml=makeReduction(req.body.parts,req.body.selected,req.body.meta||{},req.body.transcription||{});
+ const xml=typeof req.body.xml==='string'&&req.body.xml.includes('<score-partwise')?req.body.xml:makeReduction(req.body.parts,req.body.selected,req.body.meta||{},req.body.transcription||{});
  const parsed=parseXML(Buffer.from(xml));const midi=new Midi();midi.header.setTempo(120);
  const part=parsed.parts[0];if(!part)throw Error('Empty exported score.');
- const bars=[];let tick=0;for(const m of part.meta.measureMeta){bars.push(tick);tick+=m.nominalQ*480;}
+ const bars=[];let tick=0;for(let i=0;i<part.meta.measureMeta.length;i++){const m=part.meta.measureMeta[i];bars.push(tick);const end=Math.max(m.nominalQ,...part.events.filter(e=>e.measure===i).map(e=>Number(e.start)+Number(e.dur)));tick+=end*480;}
  const byVoice=new Map();for(const e of part.events){if(e.isRest)continue;const key=e.voice;if(!byVoice.has(key))byVoice.set(key,[]);byVoice.get(key).push({...e,at:bars[e.measure]+Math.round(e.start*480)});}
  for(const [voice,events] of byVoice){const track=midi.addTrack();track.name='Voice '+voice;const active=new Map(),merged=[];
   for(const e of events.sort((a,b)=>a.at-b.at||a.midi-b.midi)){const k=e.midi;const existing=active.get(k);
@@ -721,7 +724,8 @@ app.post('/api/export-midi',(req,res)=>{try{
  res.type('audio/midi').attachment('keyboard-reduction.mid').send(Buffer.from(midi.toArray()));
 }catch(e){res.status(400).json({error:e.message})}});
 app.post('/api/export-mxl',async(req,res)=>{try{
- const xml=makeReduction(req.body.parts,req.body.selected,req.body.meta||{},req.body.transcription||{});
+ const xml=typeof req.body.xml==='string'&&req.body.xml.includes('<score-partwise')?req.body.xml:makeReduction(req.body.parts,req.body.selected,req.body.meta||{},req.body.transcription||{});
+ parseXML(Buffer.from(xml));
  const zip=new JSZip();zip.file('mimetype','application/vnd.recordare.musicxml');
  zip.file('META-INF/container.xml','<?xml version="1.0" encoding="utf-8"?><container><rootfiles><rootfile full-path="score.musicxml" media-type="application/vnd.recordare.musicxml+xml"/></rootfiles></container>');
  zip.file('score.musicxml',xml);
