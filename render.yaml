@@ -8,5 +8,7 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: OMR_TIMEOUT_MS
-        value: 240000
+      - key: OPENAI_OMR_MODEL
+        value: gpt-4.1
+      - key: OPENAI_API_KEY
+        sync: false

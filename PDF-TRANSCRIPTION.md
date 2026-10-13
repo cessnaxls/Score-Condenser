@@ -1,27 +1,12 @@
-# PDF sheet music transcription
+# GPT photo and PDF musical transcription
 
-PDF uploads are processed with **Audiveris optical music recognition** (OMR). Audiveris writes compressed MusicXML, which is then loaded through the existing MusicXML importer and verbatim condenser. Ordinary MXL, MusicXML, and MIDI files use their existing paths.
+No Audiveris is included or required. The service rasterizes PDF pages via `pdftoppm` (Poppler) and sends page images to an online OpenAI vision model. JPG, JPEG, PNG and WEBP photos can also be sent (up to eight images/pages per import, max 20 MB per file). Multiple photos are sent in the order selected by the browser; select all images in score order. Upload MusicXML/MXL/MIDI files one at a time.
 
-## Deploying to Render
+## Render setup
+Deploy with the provided Dockerfile and render.yaml. Set `OPENAI_API_KEY` in Render > Environment to a server-side API key with sufficient funds and model access. Never include keys in source control or put them in browser code. `OPENAI_OMR_MODEL` defaults to `gpt-4.1`; configure a vision-capable model that supports JSON output. OpenAI API calls are billed separately from ChatGPT subscriptions. Each import transmits your document images to OpenAI; do not upload documents without authorization.
 
-This release uses a **Docker** Render web service, rather than the old Node native build, to install Audiveris. Use `render.yaml` when deploying a new service or change an existing service to Docker. The recommended Starter plan reflects the CPU/RAM needed for OMR; free-tier memory may be insufficient for multi-page PDFs. Docker downloads the latest official Linux Audiveris `.deb` from GitHub at build time; the build needs internet access. Upstream packaging may change: if it does, pin `AUDIVERIS_DEB_URL` to an official, tested release asset and update the Docker build. The `/api/pdf-omr/status` endpoint shows which binary is configured, not whether it was executed successfully.
+## Note-value interpretation
+The transcription prompt explicitly asks the model to distinguish square breve and longa notes and produce MusicXML `<type>breve</type>` or `<type>long</type>`. The literal export now retains the imported note `type` field rather than always deriving it from note duration. The note time span is preserved and audited by the existing event-based verification. This is requested behavior, not a claim that every medieval or Renaissance glyph is automatically recognized correctly.
 
-For other deployments, install Audiveris separately and set `AUDIVERIS_BIN` to its executable. The command line used is: `audiveris -batch -transcribe -export -output <folder> -- <input.pdf>`.
-
-## Workflow
-
-1. Upload a PDF scan or generated sheet music PDF (up to 20 MB).
-2. Wait for recognition and inspect the part list. Recognition may be slow for multi-page scores.
-3. **Compare the recognized notation against the source PDF** and acknowledge that it needs review.
-4. Select voices, preview the condensed score and run the existing output audit.
-5. Export MusicXML/MXL/PDF/MIDI. Treat these exports as **unverified against the original PDF** until the notes have been manually checked/corrected in an external score editor.
-
-**Important:** the automatic audit can prove (within its implemented scope) that recognized notes survive condensation; it cannot prove that the original PDF was recognized accurately. The review checkbox is a disclosure, not a certification. OMR occasionally misreads ties, accidentals, tuplets, lyrics, measure lines, voice assignments, and overlapping rhythms. For critical transcriptions, edit the recognized MusicXML in MuseScore or another notation editor and reimport it after corrections.
-
-## Limitations
-
-- Only PDFs containing legible printed notation are supported. Handwritten or degraded prints are unreliable.
-- PDFs whose OMR export contains multiple separately exported movements are rejected instead of silently discarding material.
-- Source PDF pages are not edited or retained by the server. Each upload is written to a private temporary directory and deleted when recognition completes or fails.
-- Audiveris and its native dependencies must be present at runtime. An ordinary `npm start` without Audiveris will not transcribe PDFs.
-- Large multi-page scores may exceed service memory or the 240-second recognition timeout.
+## Mandatory review and limits
+GPT-generated MusicXML can contain wrong pitches, voices, tied notes, accidentals, note values or page alignment. Any uncertain symbols returned by the model are shown in the app. Imported GPT notation is marked unverified and requires an acknowledgment before preview/engraving. The existing integrity audit only compares the GPT-recognized notation against the *condensed* notation, not against the source photos. Cross-image verification or perfect mensural notation support is not established. Large/complex scores can exceed model output limits; this initial integration supports up to 8 pages at a time, and rejects incomplete generated XML instead of using it silently. Multi-page PDFs are limited to eight pages. Source MusicXML can be exported after review. End-to-end OpenAI API and Docker deployment testing is required.

@@ -27,6 +27,7 @@ Render deploy: publish this directory to GitHub, create a Render Node web servic
 - No input notes, onsets, durations, clefs or voices are changed by the automatic layout step.
 - Score fidelity validation is unchanged. Automatic layout cannot solve all conflicting notehead/voice overlaps; those require a more advanced engraving/voice assignment algorithm.
 
-## NEW: PDF sheet music recognition
 
-PDFs can now be uploaded and interpreted with Audiveris OMR before verbatim condensation. **This is not guaranteed note-for-note accurate recognition.** Audiveris must be installed; the included Docker deployment installs it for Render. See `PDF-TRANSCRIPTION.md` for installation, review obligations, costs/resource limits and known recognition errors.
+## GPT photo/PDF recognition (no Audiveris)
+
+See [PDF-TRANSCRIPTION.md](PDF-TRANSCRIPTION.md) for deployment, costs, usage, note support, limitations and manual review. Upload ordered sheet-music photos or a PDF, then review the GPT-recognized MusicXML and apply verbatim condensation. `OPENAI_API_KEY` is required on Render.
