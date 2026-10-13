@@ -104,8 +104,8 @@ export async function analyzeStaffGeometry(buffer){
  }
  return {imageWidth:info.width,imageHeight:info.height,staffCount:staves.length,staves,confidence:staves.length?'staff-lines-detected':'uncertain',warning:staves.length?null:'Unable to identify consistent sets of five staff lines; GPT results require extra visual review.'};
 }
-async function queryGPT(image,system,previous,geometry=null){
- const userText=`${geometry?.staffCount?'Geometric preflight detected '+geometry.staffCount+' sets of five staff lines at image y positions: '+geometry.staves.map((s,i)=>'staff '+(i+1)+': '+s.lines.join(',')).join('; ')+'. Use this only to locate staves, never as evidence for notes or pitches. ':''}Transcribe page ${system.page}, system ${system.system}, with ${system.staffCount||'unknown'} staff group(s). Preserve ALL visible notes of this system. ${previous?'The prior system had '+previous+' staves: maintain part order and identities.':''} Report unreadable markings specifically. Do not hallucinate.`;
+async function queryGPT(image,system,previous,geometry=null,retryInstruction=""){
+ const userText=`${geometry?.staffCount?'Geometric preflight detected '+geometry.staffCount+' sets of five staff lines at image y positions: '+geometry.staves.map((s,i)=>'staff '+(i+1)+': '+s.lines.join(',')).join('; ')+'. Use this only to locate staves, never as evidence for notes or pitches. ':''}Transcribe page ${system.page}, system ${system.system}, with ${system.staffCount||'unknown'} staff group(s). Preserve ALL visible notes of this system. ${previous?'The prior system had '+previous+' staves: maintain part order and identities.':''} Report unreadable markings specifically. Do not hallucinate. ${retryInstruction}`;
  const request={model:process.env.OPENAI_OMR_MODEL||'gpt-4.1',temperature:0,response_format:{type:'json_object'},messages:[{role:'system',content:systemInstruction},{role:'user',content:[{type:'text',text:userText},{type:'image_url',image_url:{url:'data:image/png;base64,'+image.toString('base64'),detail:'high'}}]}],max_completion_tokens:16000};
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),Number(process.env.OMR_CALL_TIMEOUT_MS)||180000);
  let response;
@@ -119,6 +119,48 @@ async function queryGPT(image,system,previous,geometry=null){
  const doc=parser.parse(obj.musicxml.replace(/^```(?:xml)?\s*/,'').replace(/```\s*$/,''));
  if(!doc['score-partwise'])throw Error(`GPT did not return score-partwise MusicXML at page ${system.page}, system ${system.system}`);
  return {doc:doc['score-partwise'],uncertainties:arr(obj.uncertainties).map(String),staffCount:Number(obj.staffCount)||null,measureCount:Number(obj.measureCount)||null};
+}
+/** Only expand a MusicXML multiple-rest when its exact span is encoded by the source. */
+function normalizeDeclaredMultiRests(transcription){
+ const parts=arr(transcription.doc.part);
+ for(const part of parts){
+  const expanded=[];
+  for(const m of arr(part.measure)){
+   const raw=m?.attributes?.['measure-style']?.['multiple-rest'];
+   const n=Number(typeof raw==='object'?raw?.['#text']:raw);
+   if(!Number.isInteger(n)||n<2||n>512){expanded.push(m);continue;}
+   // Only expand a measure that holds no pitched musical events. Keep rests
+   // and avoid synthesizing duration values or altering other voices.
+   if(arr(m.note).some(note=>note.pitch||note['unpitched'])){expanded.push(m);continue;}
+   const first={...m};
+   if(first.attributes){
+    first.attributes={...first.attributes};
+    delete first.attributes['measure-style'];
+   }
+   // A multi-rest is an explicit statement that all these measures are silent.
+   // Use measure-rest elements without invented durations; inherit the meter.
+   first.note={rest:{'@_measure':'yes'}};
+   expanded.push(first);
+   for(let i=1;i<n;i++)expanded.push({note:{rest:{'@_measure':'yes'}}});
+  }
+  part.measure=expanded;
+ }
+}
+async function retryUnevenSystem(result,previousParts){
+ const current=arr(result.transcription.doc.part);
+ const counts=current.map(p=>arr(p.measure).length);
+ const expected=Math.max(...counts,0);
+ if(!expected||counts.every(n=>n===expected))return result;
+ // Retry against the IMAGE, not a guessed completion of the original XML.
+ const image=result.data;
+ const retrySystem={...result,system:result.system,staffCount:current.length};
+ const retryPrompt=`You must emit the same number of measures for EACH staff. Previously the staff measure counts were ${counts.join(', ')}; the maximum visible count was ${expected}. Read the source image again, including all barlines and measure rests. A staff with several empty measures still needs separate measure elements, unless an explicit multiple-rest span is encoded. NEVER fill a measure with guessed notes, never split a note merely to get the desired count, and report obscured measures in uncertainties. The next response must represent every visible staff and align barlines across parts.`;
+ const fixed=await queryGPT(image,retrySystem,previousParts,null,retryPrompt);
+ normalizeDeclaredMultiRests(fixed);
+ const nextCounts=arr(fixed.doc.part).map(p=>arr(p.measure).length);
+ if(nextCounts.length!==counts.length||new Set(nextCounts).size!==1)
+  throw Error(`OMR could not align bars on page ${result.page}, system ${result.system}: first pass [${counts.join(', ')}], second pass [${nextCounts.join(', ')}]. No music was invented; check the original image or use MusicXML import.`);
+ return {...result,transcription:fixed};
 }
 function mergeSystems(results){
  const first=results[0].transcription.doc;
@@ -170,7 +212,13 @@ export async function recognizeImages(files,{parseXML,onProgress=()=>{},mode='li
    if(geometry.warning)warnings.push(`Page ${system.page}, system ${system.system}: ${geometry.warning}`);
    if(system.staffCount&&geometry.staffCount&&system.staffCount!==geometry.staffCount)warnings.push(`Page ${system.page} system ${system.system}: image segmenter found ${system.staffCount} staves but OMR preflight found ${geometry.staffCount}. Check system cropping.`);
   }
-  const transcription=await queryGPT(system.data,system,precedingParts,geometry);
+  let transcription=await queryGPT(system.data,system,precedingParts,geometry);
+  normalizeDeclaredMultiRests(transcription);
+  const counts=arr(transcription.doc.part).map(p=>arr(p.measure).length);
+  if(new Set(counts).size>1){
+   warnings.push(`Page ${system.page}, system ${system.system}: inconsistent staff bar counts [${counts.join(', ')}]. Retrying from the image.`);
+   transcription=(await retryUnevenSystem({...system,transcription},precedingParts)).transcription;
+  }
   if(geometry?.staffCount&&transcription.staffCount&&geometry.staffCount!==transcription.staffCount)
    warnings.push(`Page ${system.page} system ${system.system}: detected ${geometry.staffCount} staves but AI reported ${transcription.staffCount}. Review for an omitted or invented staff.`);
   const count=arr(transcription.doc.part).length;
