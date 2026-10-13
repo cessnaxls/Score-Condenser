@@ -382,7 +382,7 @@ function analyzeAndRepairRests(parts,selected){
  }
  return {parts:cloned,report:{addedRests,voicesChanged,measuresRepaired:repairedMeasureKeys.size,details}};
 }
-app.post('/api/analyze',(req,res)=>{try{
+app.post('/api/analyze',(req,res)=>{return res.status(403).json({error:'Automatic rest repair disabled in verbatim mode.'});try{
  const parts=Array.isArray(req.body?.parts)?req.body.parts:[],selected=Array.isArray(req.body?.selected)?req.body.selected:[];
  if(!parts.length)throw Error('Import a score before running Analyze.');
  if(!selected.length)throw Error('Select at least one voice to analyze.');
@@ -419,12 +419,61 @@ function makeLiteralReduction(parts,selected,meta={}){
  }
  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name></part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
-function makeReduction(parts,selected,meta={},transcription={}){
- // Literal mode now uses the same canonical onset/lane emitter as Intelligent mode so
- // simultaneous compatible pitches are true chords in both modes. Imported rests remain
- // source-owned and 100% preserved. Intelligent mode is still the place for future packing
- // heuristics, but neither mode gets a separate rhythmic/beaming pipeline.
- return makeIntelligentReduction(parts,selected,meta,{...transcription,literal:!transcription?.intelligent});
+// Strict verbatim reduction: never invoke heuristic note filtering, repitching or recomposition.
+function makeReduction(parts,selected,meta={}){
+ const xml=makeVerbatimReduction(parts,selected,meta);
+ const out=parseXML(Buffer.from(xml));
+ const src=selectedStreams(parts,selected).flatMap(s=>s.events.filter(e=>!e.isRest));
+ const got=out.parts.flatMap(p=>p.events.filter(e=>!e.isRest));
+ const signature=e=>[e.measure,Number(e.start).toFixed(5),Number(e.dur).toFixed(5),e.midi,e.step,e.alter||0,e.octave].join('|');
+ const counts=items=>{const map=new Map();for(const e of items){const k=signature(e);map.set(k,(map.get(k)||0)+1);}return map};
+ const a=counts(src),b=counts(got);const problems=[];
+ for(const [k,n] of a)if(n!==b.get(k))problems.push(`missing/changed ${k}: expected ${n}, found ${b.get(k)||0}`);
+ for(const [k,n] of b)if(!a.has(k))problems.push(`unexpected ${k}: ${n}`);
+ if(problems.length)throw Error('Verbatim verification failed; export blocked. '+problems.slice(0,5).join('; '));
+ return xml;
+}
+function makeVerbatimReduction(parts,selected,meta={}){
+ const streams=selectedStreams(parts,selected);if(!streams.length)throw Error('Select at least one voice.');
+ const first=parts.find(p=>selected.some(k=>k.startsWith(`${p.id}|`)))||parts[0];
+ const div=480,maxM=Math.max(0,...streams.flatMap(st=>st.events.map(e=>e.measure||0)));
+ let measures='';
+ for(let m=0;m<=maxM;m++){
+  const timing=measureTiming(first,streams,m,maxM),targetQ=timing.targetQ;
+  const lanes=[];
+  for(const stream of streams){
+   const events=stream.events.filter(e=>(e.measure||0)===m);
+   for(const e of events)assertEventFits(e,targetQ,m,stream.name);
+   // Interval partitioning, rather than suppressing overlapping voices, retains all notes.
+   const buckets=new Map();
+   for(const e of events){const staff=e.isRest?(e.sourceStaff===2?2:inferredStreamStaff(stream)):(e.midi>=60?1:2);const key=`${stream.voiceNo}:${staff}`;if(!buckets.has(key))buckets.set(key,{staff,events:[]});buckets.get(key).events.push(e);}
+   for(const group of buckets.values()){
+    const laneEnds=[];
+    for(const e of group.events.sort((a,b)=>a.start-b.start||b.dur-a.dur)){
+     let lane=laneEnds.find(x=>x.end<=e.start+1e-7);
+     if(!lane){lane={staff:group.staff,events:[],end:0};laneEnds.push(lane);}
+     lane.events.push(e);lane.end=e.start+e.dur;
+    }
+    lanes.push(...laneEnds);
+   }
+  }
+  if(!lanes.length)lanes.push({staff:1,events:[],end:0});
+  let body='';
+  for(let i=0;i<lanes.length;i++){
+   const lane=lanes[i];let cursor=0,voiceNo=i+1;
+   for(const e of lane.events){
+    if(e.start>cursor+1e-7)body+=forwardXML(e.start-cursor,div,voiceNo,lane.staff);
+    body+=e.isRest?literalRestXML(e,voiceNo,div,lane.staff):noteXML({...e,engravingStaff:lane.staff},voiceNo,div,false,'',e.beams||[]);
+    cursor=e.start+e.dur;
+   }
+   body+=padForward(cursor,targetQ,div,voiceNo,lane.staff);
+   if(i<lanes.length-1)body+=`<backup><duration>${Math.round(targetQ*div)}</duration></backup>`;
+  }
+  const mm=first?.meta?.measureMeta?.[m]||{};
+  const attrs=`<attributes><divisions>${div}</divisions><key><fifths>${Number(mm.fifths??first.meta?.fifths??0)}</fifths></key><time><beats>${timing.beats}</beats><beat-type>${timing.beatType}</beat-type></time>${m===0?'<staves>2</staves><part-symbol>brace</part-symbol><clef number="1"><sign>G</sign><line>2</line></clef><clef number="2"><sign>F</sign><line>4</line></clef>':''}</attributes>`;
+  measures+=`<measure number="${m+1}"${Math.abs(targetQ-timing.nominalQ)>.0001?' implicit="yes"':''}>${attrs}${body}</measure>`;
+ }
+ return `<?xml version="1.0" encoding="UTF-8"?><score-partwise version="4.0"><work><work-title>${esc(meta.title||'Untitled')}</work-title></work>${meta.subtitle?`<movement-title>${esc(meta.subtitle)}</movement-title>`:''}<identification><creator type="composer">${esc([meta.composer,meta.dates].filter(Boolean).join(' '))}</creator>${meta.collection?`<source>${esc(meta.collection)}</source>`:''}</identification><part-list><score-part id="P1"><part-name>Verbatim condensation</part-name></score-part></part-list><part id="P1">${measures}</part></score-partwise>`;
 }
 
 function canonicalNoteSignature(streams){
@@ -703,11 +752,11 @@ async function getToolkit(){if(!toolkitPromise)toolkitPromise=createVerovioModul
 function engravingGeometry(layout={}){const landscape=layout.orientation==='landscape',base=layout.pageSize==='a4'?{w:2100,h:2970,pw:595.28,ph:841.89}:{w:2159,h:2794,pw:612,ph:792};return landscape?{w:base.h,h:base.w,pw:base.ph,ph:base.pw}:{w:base.w,h:base.h,pw:base.pw,ph:base.ph};}
 function engravingOptions(layout={}){const {w,h}=engravingGeometry(layout),scale=Number(layout.scale||42),spacing=Number(layout.noteSpacing||1),stretch=Number(layout.barStretch||1),staff=Number(layout.staffSpacing||12),system=Number(layout.systemSpacing||10),margin=Number(layout.margin||60);return{pageWidth:w,pageHeight:h,pageMarginTop:margin,pageMarginBottom:margin,pageMarginLeft:margin,pageMarginRight:margin,scale,breaks:'auto',header:'auto',footer:'none',font:'Leipzig',spacingLinear:.25*spacing*stretch,spacingNonLinear:.6*spacing,spacingStaff:staff,spacingSystem:system,justifyVertically:false,systemDivider:'none'};}
 async function renderScore(body){const {parts,selected,meta={},layout={},transcription={}}=body;const xml=makeReduction(parts,selected,meta,transcription);const tk=await getToolkit();tk.setOptions(engravingOptions(layout));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));return{xml,pages,layout};}
-app.post('/api/audit',(req,res)=>{try{res.json(auditScore(req.body,parseXML));}catch(e){res.status(400).json({error:e.message})}});
-app.post('/api/audit/apply',async(req,res)=>{try{const before=auditScore(req.body,parseXML),issue=before.issues.find(x=>x.id===req.body.issueId);if(!issue)throw Error('Correction is no longer current. Run the audit again.');const xml=applyAuditPatch(req.body.xml,issue);const after=auditScore({...req.body,xml},parseXML);const tk=await getToolkit();tk.setOptions(engravingOptions(req.body.layout||{}));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));res.json({musicxml:xml,pages,pageCount:pages.length,audit:after});}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/audit',(req,res)=>{try{const xml=makeReduction(req.body.parts,req.body.selected,req.body.meta||{});res.json(auditScore({...req.body,xml,transposeSemitones:0,intelligent:false,octaveTranscription:false},parseXML));}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/audit/apply',(_,res)=>res.status(403).json({error:'Verbatim mode forbids changing musical notes. Correct the source file instead.'}));
 app.post('/api/engrave',async(req,res)=>{try{const r=await renderScore(req.body);res.json({pages:r.pages,musicxml:r.xml,pageCount:r.pages.length});}catch(e){console.error(e);res.status(400).json({error:e.message})}});
 app.post('/api/export-midi',(req,res)=>{try{
- const xml=typeof req.body.xml==='string'&&req.body.xml.includes('<score-partwise')?req.body.xml:makeReduction(req.body.parts,req.body.selected,req.body.meta||{},req.body.transcription||{});
+ const xml=makeReduction(req.body.parts,req.body.selected,req.body.meta||{});
  const parsed=parseXML(Buffer.from(xml));const midi=new Midi();midi.header.setTempo(120);
  const part=parsed.parts[0];if(!part)throw Error('Empty exported score.');
  const bars=[];let tick=0;for(let i=0;i<part.meta.measureMeta.length;i++){const m=part.meta.measureMeta[i];bars.push(tick);const end=Math.max(m.nominalQ,...part.events.filter(e=>e.measure===i).map(e=>Number(e.start)+Number(e.dur)));tick+=end*480;}
@@ -724,7 +773,7 @@ app.post('/api/export-midi',(req,res)=>{try{
  res.type('audio/midi').attachment('keyboard-reduction.mid').send(Buffer.from(midi.toArray()));
 }catch(e){res.status(400).json({error:e.message})}});
 app.post('/api/export-mxl',async(req,res)=>{try{
- const xml=typeof req.body.xml==='string'&&req.body.xml.includes('<score-partwise')?req.body.xml:makeReduction(req.body.parts,req.body.selected,req.body.meta||{},req.body.transcription||{});
+ const xml=makeReduction(req.body.parts,req.body.selected,req.body.meta||{});
  parseXML(Buffer.from(xml));
  const zip=new JSZip();zip.file('mimetype','application/vnd.recordare.musicxml');
  zip.file('META-INF/container.xml','<?xml version="1.0" encoding="utf-8"?><container><rootfiles><rootfile full-path="score.musicxml" media-type="application/vnd.recordare.musicxml+xml"/></rootfiles></container>');
