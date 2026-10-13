@@ -750,11 +750,48 @@ function makeIntelligentReduction(parts,selected,meta={},intelligence={}){
 let toolkitPromise;
 async function getToolkit(){if(!toolkitPromise)toolkitPromise=createVerovioModule().then(m=>new VerovioToolkit(m));return toolkitPromise;}
 function engravingGeometry(layout={}){const landscape=layout.orientation==='landscape',base=layout.pageSize==='a4'?{w:2100,h:2970,pw:595.28,ph:841.89}:{w:2159,h:2794,pw:612,ph:792};return landscape?{w:base.h,h:base.w,pw:base.ph,ph:base.pw}:{w:base.w,h:base.h,pw:base.pw,ph:base.ph};}
-function engravingOptions(layout={}){const {w,h}=engravingGeometry(layout),scale=Number(layout.scale||42),spacing=Number(layout.noteSpacing||1),stretch=Number(layout.barStretch||1),staff=Number(layout.staffSpacing||12),system=Number(layout.systemSpacing||10),margin=Number(layout.margin||60);return{pageWidth:w,pageHeight:h,pageMarginTop:margin,pageMarginBottom:margin,pageMarginLeft:margin,pageMarginRight:margin,scale,breaks:'auto',header:'auto',footer:'none',font:'Leipzig',spacingLinear:.25*spacing*stretch,spacingNonLinear:.6*spacing,spacingStaff:staff,spacingSystem:system,justifyVertically:false,systemDivider:'none'};}
-async function renderScore(body){const {parts,selected,meta={},layout={},transcription={}}=body;const xml=makeReduction(parts,selected,meta,transcription);const tk=await getToolkit();tk.setOptions(engravingOptions(layout));tk.loadData(xml);const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));return{xml,pages,layout};}
+// Page composition is layout-only: never alters imported pitches, rhythms or voices.
+function engravingOptions(layout={}){
+ const {w,h}=engravingGeometry(layout);
+ const clamp=(value,min,max,defaultValue)=>Number.isFinite(Number(value))?Math.max(min,Math.min(max,Number(value))):defaultValue;
+ const scale=clamp(layout.scale,28,62,40),spacing=clamp(layout.noteSpacing,.6,1.8,1.12),stretch=clamp(layout.barStretch,.65,1.8,1.08);
+ const staff=clamp(layout.staffSpacing,6,24,14),system=clamp(layout.systemSpacing,4,30,15),margin=clamp(layout.margin,25,160,75);
+ return {pageWidth:w,pageHeight:h,pageMarginTop:margin,pageMarginBottom:margin,pageMarginLeft:margin,pageMarginRight:margin,scale,
+  breaks:'auto',header:'auto',footer:'none',font:'Leipzig',spacingLinear:.35*spacing*stretch,spacingNonLinear:.72*spacing,
+  spacingStaff:staff,spacingSystem:system,justifyVertically:false,systemDivider:'none'};
+}
+function countMeasuresInSvg(svg){
+ // Count unique rendered measures, not staves: grand-staff measures appear more than once.
+ const ids=new Set();
+ for(const match of svg.matchAll(/\bclass="[^"]*\bmeasure\b[^"]*"[^>]*\b(?:id|data-id)="([^"]+)"|\b(?:id|data-id)="([^"]+)"[^>]*\bclass="[^"]*\bmeasure\b[^"]*"/g))ids.add(match[1]||match[2]);
+ return ids.size;
+}
+async function renderScore(body){
+ const {parts,selected,meta={},layout={},transcription={}}=body;
+ const xml=makeReduction(parts,selected,meta,transcription);
+ const tk=await getToolkit();
+ // With the automatic print-layout setting, test only engraving geometries. The final
+ // selection prefers legible notation but avoids a nearly blank trailing page.
+ const baseline=Number(layout.scale)||40;
+ const candidates=layout.autoFit===false?[baseline]:[baseline,baseline-2,baseline-4,baseline-6].filter(v=>v>=34);
+ let best=null;
+ for(const scale of candidates){
+  const chosen={...layout,scale};tk.setOptions(engravingOptions(chosen));tk.loadData(xml);
+  const n=tk.getPageCount();if(n<1)throw Error('Engraving produced no printable pages.');
+  const last=tk.renderToSVG(n,{});const lastMeasures=countMeasuresInSvg(last);
+  // Page count dominates; avoid sacrificing font size to remove a modestly-filled page.
+  // Strongly penalize a last page holding only a single measure/system.
+  const lastSparse=n>1&&lastMeasures>0&&lastMeasures<=2;
+  const quality=n*12+(lastSparse?9:0)+(baseline-scale)*1.6;
+  if(!best||quality<best.quality)best={quality,chosen};
+ }
+ tk.setOptions(engravingOptions(best.chosen));tk.loadData(xml);
+ const pages=[];for(let i=1;i<=tk.getPageCount();i++)pages.push(tk.renderToSVG(i,{}));
+ return {xml,pages,layout:best.chosen};
+}
 app.post('/api/audit',(req,res)=>{try{const xml=makeReduction(req.body.parts,req.body.selected,req.body.meta||{});res.json(auditScore({...req.body,xml,transposeSemitones:0,intelligent:false,octaveTranscription:false},parseXML));}catch(e){res.status(400).json({error:e.message})}});
 app.post('/api/audit/apply',(_,res)=>res.status(403).json({error:'Verbatim mode forbids changing musical notes. Correct the source file instead.'}));
-app.post('/api/engrave',async(req,res)=>{try{const r=await renderScore(req.body);res.json({pages:r.pages,musicxml:r.xml,pageCount:r.pages.length});}catch(e){console.error(e);res.status(400).json({error:e.message})}});
+app.post('/api/engrave',async(req,res)=>{try{const r=await renderScore(req.body);res.json({pages:r.pages,musicxml:r.xml,pageCount:r.pages.length,layout:r.layout});}catch(e){console.error(e);res.status(400).json({error:e.message})}});
 app.post('/api/export-midi',(req,res)=>{try{
  const xml=makeReduction(req.body.parts,req.body.selected,req.body.meta||{});
  const parsed=parseXML(Buffer.from(xml));const midi=new Midi();midi.header.setTempo(120);

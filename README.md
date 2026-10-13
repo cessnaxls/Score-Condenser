@@ -16,3 +16,13 @@ Render deploy: publish this directory to GitHub, create a Render Node web servic
 - Printed PDF notation must be visually reviewed; no PDF-to-source audit exists.
 - Source expressive metadata (articulations, lyrics, ornamentation, detailed staff assignment) is not yet guaranteed to round-trip. This build verifies pitched-note events rather than every engraving symbol.
 - Runtime dependency installation and full Verovio rendering are not yet validated in this workspace.
+
+
+## Engraving quality update
+
+- Better default music scale, staff spacing, system spacing, page margins and note spacing.
+- Optional automatic page fitting tries a narrow range of music sizes, reducing nearly empty trailing pages where possible.
+- Manual engraving sliders and portrait/landscape selection remain available. Disable Auto-fit to use the exact selected scale.
+- The PDF now uses the exact automatically selected layout page dimensions and same SVG preview.
+- No input notes, onsets, durations, clefs or voices are changed by the automatic layout step.
+- Score fidelity validation is unchanged. Automatic layout cannot solve all conflicting notehead/voice overlaps; those require a more advanced engraving/voice assignment algorithm.
