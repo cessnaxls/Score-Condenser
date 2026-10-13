@@ -1,3 +1,4 @@
+import {matchSymbol,listSymbols} from './symbol-memory.js';
 import {symbolEvidence} from './omr-bridge.js';
 /** Linewise GPT optical music transcription. No Audiveris. Every image/system remains unverified until human proofread. */
 import {mkdtemp,writeFile,readdir,readFile,rm} from 'node:fs/promises';
@@ -216,9 +217,28 @@ export async function recognizeImages(files,{parseXML,onProgress=()=>{},mode='li
   let symbols=null;
   if(mode==='hybrid'){
    try{symbols=await symbolEvidence(system.data);
+    // Match a bounded sample of detected candidate symbols against saved exemplars.
+    // These are advisory only; the GPT result and MusicXML are never overwritten.
+    const library=await listSymbols();const learned=[];
+    if(library.length){
+     const meta=await sharp(system.data).metadata();let scanned=0;
+     for(const staff of symbols.staves){for(const candidate of staff.noteheadCandidates){
+      if(scanned++>=120)break;
+      const b=candidate.bbox;if(!Array.isArray(b)||b.length!==4)continue;
+      const pad=Math.max(3,Math.round(staff.spacing*.5));
+      const left=Math.max(0,Math.floor(b[0]-pad)),top=Math.max(0,Math.floor(b[1]-pad));
+      const width=Math.min(meta.width-left,Math.ceil(b[2]+pad*2)),height=Math.min(meta.height-top,Math.ceil(b[3]+pad*2));
+      if(width<4||height<4)continue;
+      try{const crop=await sharp(system.data).extract({left,top,width,height}).png().toBuffer();
+       const match=(await matchSymbol(crop,1)).matches[0];
+       if(match?.similarity>=94)learned.push({staff:staff.staffIndex,x:candidate.x,y:candidate.y,label:match.label,similarity:match.similarity,requiresConfirmation:true});
+      }catch{}
+     }if(scanned>=120)break;}
+    }
+    if(learned.length)warnings.push(`Page ${system.page} system ${system.system}: ${learned.length} candidate symbols resemble saved examples. Review before accepting their labels.`);
     symbolReports.push({page:system.page,system:system.system,staffCount:symbols.staffCount,
       noteheadCandidates:symbols.staves.reduce((n,s)=>n+s.noteheadCandidates.length,0),
-      barlineCandidates:symbols.staves.map(s=>s.barlineCandidates.length),
+      barlineCandidates:symbols.staves.map(s=>s.barlineCandidates.length),learnedMatches:learned,
       staves:symbols.staves.map(s=>({lines:s.lines,spacing:s.spacing,
         notes:s.noteheadCandidates.map(n=>({x:n.x,y:n.y,staffStep:n.staffStep,confidence:n.confidence})),
         bars:s.barlineCandidates}))});

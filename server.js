@@ -10,12 +10,20 @@ import { VerovioToolkit } from 'verovio/esm';
 import PDFDocument from 'pdfkit';
 import { auditScore, applyAuditPatch } from './audit.js';
 import { recognizeImages, pdfEngineStatus } from './pdf-omr.js';
+import {listSymbols,matchSymbol,trainSymbol,deleteSymbol,symbolLabels} from './symbol-memory.js';
 
 const app=express();
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
 app.use(express.json({limit:'60mb'})); app.use(express.static('public'));
 app.get('/health',(_,r)=>r.json({ok:true}));
 app.get('/api/pdf-omr/status',(_,r)=>r.json(pdfEngineStatus()));
+// Explicit teaching only. Similarity matches are advisory and never rewrite score notes.
+const symbolCrop=multer({storage:multer.memoryStorage(),limits:{fileSize:3*1024*1024}});
+app.get('/api/omr-memory',async(_,res)=>{try{res.json({entries:await listSymbols(),labels:symbolLabels,persistent:!!process.env.OMR_MEMORY_DIR});}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/omr-memory/teach',symbolCrop.single('crop'),async(req,res)=>{try{if(!req.file)throw Error('Upload one cropped musical symbol');res.json(await trainSymbol({buffer:req.file.buffer,label:String(req.body.label||''),description:req.body.description,context:req.body.context}));}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/omr-memory/match',symbolCrop.single('crop'),async(req,res)=>{try{if(!req.file)throw Error('Upload one cropped musical symbol');res.json(await matchSymbol(req.file.buffer));}catch(e){res.status(400).json({error:e.message})}});
+app.delete('/api/omr-memory/:id',async(req,res)=>{try{const removed=await deleteSymbol(req.params.id);res.status(removed?200:404).json({removed});}catch(e){res.status(500).json({error:e.message})}});
+
 const arr=x=>x==null?[]:Array.isArray(x)?x:[x];
 const stepSemi={C:0,D:2,E:4,F:5,G:7,A:9,B:11};
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));
