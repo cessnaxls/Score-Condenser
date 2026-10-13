@@ -132,6 +132,24 @@ function queueOmr(job,files){
  job.run=run;
  if(!omrActive)queueMicrotask(run);
 }
+// Allows precise correction of imported OMR events without asking AI to invent replacement notes.
+// Corrections re-enter the existing verbatim generation and source-to-output audit.
+app.post('/api/review/validate',(req,res)=>{try{
+ const score=req.body?.score;
+ if(!score||!Array.isArray(score.parts)||!score.parts.length)throw Error('No recognized score supplied.');
+ const allowed=new Set(['A','B','C','D','E','F','G']);
+ for(const part of score.parts){
+  if(!Array.isArray(part.events))throw Error('Missing events in part '+part.name);
+  for(const e of part.events){
+   if(!Number.isInteger(e.measure)||e.measure<0||e.measure>=score.measures)throw Error('Invalid measure in '+part.name);
+   if(!Number.isFinite(e.start)||e.start<0||!Number.isFinite(e.dur)||e.dur<=0)throw Error('Invalid timing in '+part.name);
+   if(!e.isRest){if(!allowed.has(e.step)||!Number.isInteger(e.octave)||e.octave<0||e.octave>9||!Number.isInteger(e.alter)||e.alter<-2||e.alter>2)throw Error('Invalid written pitch in '+part.name);
+    e.midi=(e.octave+1)*12+({C:0,D:2,E:4,F:5,G:7,A:9,B:11})[e.step]+e.alter;
+   }
+  }
+ }
+ res.json({valid:true,score});
+ }catch(e){res.status(400).json({error:e.message})}});
 app.get('/api/import-jobs/:id',(req,res)=>{
  const j=omrJobs.get(req.params.id);if(!j)return res.status(404).json({error:'Import job unavailable (server may have restarted). Please upload again.'});
  res.set('Cache-Control','no-store');res.json({state:j.state,message:j.message,error:j.error||null,completed:j.completed||0,total:j.total||0,...(j.state==='complete'?{result:j.result}:{})});

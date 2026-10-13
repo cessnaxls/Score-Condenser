@@ -144,10 +144,21 @@ export async function recognizeImages(files,{parseXML,onProgress=()=>{}}){
   onProgress({completed:results.length,total:systems.length,message:`Recognized system ${results.length} of ${systems.length} (page ${system.page}).`});
  }
  const merged=mergeSystems(results),parsed=parseXML(Buffer.from(merged.xml));
+ const emptyParts=parsed.parts.filter(p=>!p.events.length);
+ if(emptyParts.length)throw Error('GPT returned an entirely empty part: '+emptyParts.map(p=>p.name).join(', ')+'. Refusing to manufacture a condensed score.');
  const pitched=parsed.parts.flatMap(p=>p.events).filter(e=>!e.isRest).length;
+ if(parsed.parts.some(p=>p.meta.measures!==merged.measureCount))throw Error('Part measure counts disagree after recognition.');
+ for(const part of parsed.parts)for(const e of part.events){
+  if(!Number.isFinite(e.start)||!Number.isFinite(e.dur)||e.dur<=0||e.start<0)throw Error('Invalid note duration or onset in recognized part '+part.name);
+  if(!e.isRest&&(!Number.isInteger(e.midi)||e.midi<0||e.midi>127))throw Error('Recognized note out of MIDI pitch range in '+part.name);
+ }
  if(!pitched)throw Error('No pitched musical notes were recognized.');
  const uncertainties=results.flatMap(item=>item.transcription.uncertainties.map(s=>`Page ${item.page}, system ${item.system}: ${s}`));
  parsed.recognition={source:'gpt-vision-linewise',engine:process.env.OPENAI_OMR_MODEL||'gpt-4.1',reviewRequired:true,uncertainties:uncertainties.slice(0,300),warnings:[...warnings,'Optical transcription has not been independently proven note-for-note; proofread EACH staff and measure against the source before relying on the result.','The condensation audit verifies recognized data, not whether the AI recognized the printed notes correctly.'],recognizedPages:pages.length,recognizedSystems:systems.length,regions:merged.regions,recognizedNoteCount:pitched};
+ // Show the original image next to recognized events. Reduce dimensions and data size;
+ // the originals remain untouched during processing.
+ parsed.sourcePages=await Promise.all(pages.map(async (page,i)=>({page:i+1, image:'data:image/jpeg;base64,'+(await sharp(page).rotate().resize({width:1400,withoutEnlargement:true}).jpeg({quality:76}).toBuffer()).toString('base64')})));
+ parsed.review={required:true, reviewedPages:[], pageCount:pages.length, assertion:'AI transcription is UNVERIFIED. Reviewing the page is a human act, not an automatic note-accuracy certificate.'};
  parsed.recognizedMusicXML=merged.xml;
  return parsed;
 }
