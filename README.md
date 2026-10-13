@@ -26,3 +26,7 @@ Render deploy: publish this directory to GitHub, create a Render Node web servic
 - The PDF now uses the exact automatically selected layout page dimensions and same SVG preview.
 - No input notes, onsets, durations, clefs or voices are changed by the automatic layout step.
 - Score fidelity validation is unchanged. Automatic layout cannot solve all conflicting notehead/voice overlaps; those require a more advanced engraving/voice assignment algorithm.
+
+## NEW: PDF sheet music recognition
+
+PDFs can now be uploaded and interpreted with Audiveris OMR before verbatim condensation. **This is not guaranteed note-for-note accurate recognition.** Audiveris must be installed; the included Docker deployment installs it for Render. See `PDF-TRANSCRIPTION.md` for installation, review obligations, costs/resource limits and known recognition errors.

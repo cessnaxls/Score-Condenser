@@ -8,11 +8,13 @@ import createVerovioModule from 'verovio/wasm';
 import { VerovioToolkit } from 'verovio/esm';
 import PDFDocument from 'pdfkit';
 import { auditScore, applyAuditPatch } from './audit.js';
+import { recognizePDF, pdfEngineStatus } from './pdf-omr.js';
 
 const app=express();
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
 app.use(express.json({limit:'60mb'})); app.use(express.static('public'));
 app.get('/health',(_,r)=>r.json({ok:true}));
+app.get('/api/pdf-omr/status',(_,r)=>r.json(pdfEngineStatus()));
 const arr=x=>x==null?[]:Array.isArray(x)?x:[x];
 const stepSemi={C:0,D:2,E:4,F:5,G:7,A:9,B:11};
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));
@@ -111,7 +113,7 @@ function parseMidi(buf){
  return {kind:'midi',parts,measures:bars.length,metadata:{title:m.name||'',composer:''}};
 }
 async function parseMXL(buf){const zip=await JSZip.loadAsync(buf);if(Object.keys(zip.files).length>2000)throw Error('MXL archive has too many entries.');let rootPath='';const ce=zip.file('META-INF/container.xml');if(ce){const c=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_'}).parse(await ce.async('string'));const roots=arr(c?.container?.rootfiles?.rootfile);rootPath=roots.find(r=>String(r?.['@_media-type']||'').includes('musicxml'))?.['@_full-path']||roots[0]?.['@_full-path']||'';}if(!rootPath)rootPath=Object.keys(zip.files).find(n=>!zip.files[n].dir&&/\.(musicxml|xml)$/i.test(n)&&!/^META-INF\//i.test(n))||'';if(!rootPath||!zip.file(rootPath))throw Error('This .mxl archive does not contain a readable MusicXML score.');const data=await zip.file(rootPath).async('nodebuffer');if(data.length>40*1024*1024)throw Error('Uncompressed MusicXML exceeds 40 MB.');return parseXML(data);}
-app.post('/api/import',upload.single('score'),async(req,res)=>{try{if(!req.file)throw Error('Choose a score file first.');const b=req.file.buffer,n=req.file.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise')||head.startsWith('<score-timewise');let parsed;if(midi)parsed=parseMidi(b);else if(zip)parsed=await parseMXL(b);else if(xml)parsed=parseXML(b);else if(/\.midi?$/.test(n))parsed=parseMidi(b);else if(/\.mxl$/.test(n))parsed=await parseMXL(b);else if(/\.(musicxml|musxml|xml)$/.test(n))parsed=parseXML(b);else throw Error('Unsupported score file.');res.json(parsed);}catch(e){res.status(400).json({error:e.message})}});
+app.post('/api/import',upload.single('score'),async(req,res)=>{try{if(!req.file)throw Error('Choose a score file first.');const b=req.file.buffer,n=req.file.originalname.toLowerCase(),zip=b.length>=4&&b[0]===0x50&&b[1]===0x4b,midi=b.subarray(0,4).toString('ascii')==='MThd',head=b.subarray(0,512).toString('utf8').replace(/^\uFEFF/,'').trimStart(),xml=head.startsWith('<?xml')||head.startsWith('<score-partwise')||head.startsWith('<score-timewise');let parsed;if(b.subarray(0,5).toString('latin1')==='%PDF-'||/\.pdf$/.test(n))parsed=await recognizePDF(b,{parseXML,parseMXL});else if(midi)parsed=parseMidi(b);else if(zip)parsed=await parseMXL(b);else if(xml)parsed=parseXML(b);else if(/\.midi?$/.test(n))parsed=parseMidi(b);else if(/\.mxl$/.test(n))parsed=await parseMXL(b);else if(/\.(musicxml|musxml|xml)$/.test(n))parsed=parseXML(b);else throw Error('Unsupported score file.');res.json(parsed);}catch(e){res.status(400).json({error:e.message})}});
 
 function selectedStreams(parts,selected){const streams=[];let v=1,order=0;for(const p of parts)for(const voice of p.voices){const key=`${p.id}|${voice}`;if(selected.includes(key))streams.push({voiceNo:v++,order:order++,name:`${p.name} · ${voice}`,events:p.events.filter(e=>e.voice===voice)});}return streams;}
 function typeFor(q){if(q>=4)return 'whole';if(q>=2)return 'half';if(q>=1)return 'quarter';if(q>=.5)return 'eighth';if(q>=.25)return '16th';return '32nd';}

@@ -1,11 +1,12 @@
 services:
   - type: web
     name: score-condensor
-    runtime: node
-    plan: free
-    buildCommand: npm install
-    startCommand: npm start
-    healthCheckPath: /
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
     envVars:
-      - key: NODE_VERSION
-        value: 22.22.0
+      - key: NODE_ENV
+        value: production
+      - key: OMR_TIMEOUT_MS
+        value: 240000
